@@ -29,34 +29,33 @@ cd server
 uv sync
 ```
 
-### Kafka (Docker)
+Kafka (Docker):
 
 ```bash
 docker compose up -d
 ```
 
-### Server
+Server:
 
 ```bash
 cd server
 uv sync
 ```
 
-### Client
+Client:
 
 ```bash
 cd client
 npm install
 ```
-
-### Server
+Server:
 
 ```bash
 cd server/src
 uv run uvicorn main:app --reload --port 3001
 ```
 
-### Client
+Client:
 
 ```bash
 cd client
@@ -64,26 +63,6 @@ npm run dev
 ```
 
 Open [http://localhost:5173](http://localhost:5173) in multiple tabs to collaborate.
-
-## Run
-
-```bash
-cd server
-uv run src/main.py
-```
-
-## Dev
-
-```bash
-# Add a dependency
-uv add websockets
-
-# Add a dev dependency
-uv add --dev pytest
-
-# Run with auto-reload (if using watchfiles)
-uv run --with watchfiles watchfiles "python src/main.py"
-```
 
 ## pyproject.toml
 
