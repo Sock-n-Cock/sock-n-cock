@@ -29,6 +29,46 @@ cd server
 uv sync
 ```
 
+## Setup
+
+### 1. Kafka (Docker)
+
+```bash
+docker compose up -d
+```
+
+### 2. Server
+
+```bash
+cd server
+uv sync
+```
+
+### 3. Client
+
+```bash
+cd client
+npm install
+```
+
+## Run
+
+### Server
+
+```bash
+cd server/src
+uv run uvicorn main:app --reload --port 3001
+```
+
+### Client
+
+```bash
+cd client
+npm run dev
+```
+
+Open [http://localhost:5173](http://localhost:5173) in multiple tabs to collaborate.
+
 ## Run
 
 ```bash
