@@ -29,29 +29,25 @@ cd server
 uv sync
 ```
 
-## Setup
-
-### 1. Kafka (Docker)
+### Kafka (Docker)
 
 ```bash
 docker compose up -d
 ```
 
-### 2. Server
+### Server
 
 ```bash
 cd server
 uv sync
 ```
 
-### 3. Client
+### Client
 
 ```bash
 cd client
 npm install
 ```
-
-## Run
 
 ### Server
 
