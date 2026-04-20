@@ -1,7 +1,7 @@
-import { useRef, useState, useEffect, type MutableRefObject } from 'react';
+import {useRef, useState, useEffect, type RefObject} from 'react';
 import { io } from "socket.io-client";
 import Editor, { type OnMount } from '@monaco-editor/react';
-import { editor } from 'monaco-editor';
+import type { editor, IRange } from 'monaco-editor';
 import { Users, Wifi, WifiOff, Activity } from 'lucide-react';
 
 const DOC_ID = 'main-room';
@@ -15,6 +15,7 @@ const socket = io('ws://localhost:3001', {
 });
 
 type MonacoEditorInstance = Parameters<OnMount>[0];
+
 type MonacoInstance = Parameters<OnMount>[1];
 
 type User = {
@@ -41,7 +42,7 @@ type ServerOp = {
   docId: string;
   userId: string;
   text: string;
-  range: editor.IRange;
+  range: IRange;
   version: number;
 };
 
@@ -54,7 +55,7 @@ type DocumentState = {
 function applySnapshotToEditor(
   editorInstance: MonacoEditorInstance | null,
   content: string,
-  isApplyingRemote: MutableRefObject<boolean>
+  isApplyingRemote: RefObject<boolean>
 ) {
   const model = editorInstance?.getModel();
   if (!model) return false;
@@ -73,7 +74,7 @@ function applySnapshotToEditor(
 function applyRemoteOpToEditor(
   editorInstance: MonacoEditorInstance | null,
   op: ServerOp,
-  isApplyingRemote: MutableRefObject<boolean>
+  isApplyingRemote: RefObject<boolean>
 ) {
   const model = editorInstance?.getModel();
   if (!model) return false;
@@ -391,6 +392,7 @@ function App() {
           onChange={handleEditorChange}
           options={{
             fontSize: 15,
+            padding: { top: 15, bottom: 15 },
             automaticLayout: true,
             cursorSmoothCaretAnimation: 'on',
             // Prevent editing stale local text until the server snapshot arrives.
