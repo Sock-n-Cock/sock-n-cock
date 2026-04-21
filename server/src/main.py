@@ -4,7 +4,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from collab import AppliedOperation, apply_operation, rebase_operation, IncomingOperation
 from kafka import KafkaManager
+from redis_manager import RedisManager
 
+redis_manager = RedisManager()
 kafka = KafkaManager()
 sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
 
@@ -55,11 +57,13 @@ async def connect(sid, environ):
 
 @sio.event
 async def disconnect(sid):
-    for doc_id, users in rooms.items():
-        if sid in users:
-            del users[sid]
-            await sio.emit('users-changed', list(users.values()), room=doc_id)
-            await sio.emit('user-left', sid, room=doc_id)
+    doc_id = await redis_manager.remove_user(sid)
+
+    if doc_id:
+        users = await redis_manager.get_users(doc_id)
+        await sio.emit('users-changed', users, room=doc_id)
+        await sio.emit('user-left', sid, room=doc_id)
+
     print(f"Disconnected: {sid}")
 
 
@@ -67,11 +71,17 @@ async def disconnect(sid):
 async def join(sid, data):
     doc_id = data['docId']
     await sio.enter_room(sid, doc_id)
-    if doc_id not in rooms:
-        rooms[doc_id] = {}
-    rooms[doc_id][sid] = {'id': sid, 'name': data['userName'], 'color': data['color']}
-    await _emit_document_state(doc_id, sid)
-    await sio.emit('users-changed', list(rooms[doc_id].values()), room=doc_id)
+
+    user_data = {
+        'id': sid,
+        'name': data['userName'],
+        'color': data['color']
+    }
+
+    await redis_manager.add_user(doc_id, sid, user_data)
+
+    users = await redis_manager.get_users(doc_id)
+    await sio.emit('users-changed', users, room=doc_id)
 
 
 @sio.event
