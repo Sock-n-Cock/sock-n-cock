@@ -13,3 +13,13 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+
+    redis:
+      image: redis:alpine
+      ports:
+        - "6379:6379"
+      restart: unless-stopped
+      networks:
+        - app-network
+      volumes:
+        - redis-data:/data
