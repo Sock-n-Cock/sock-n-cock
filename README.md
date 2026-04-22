@@ -1,61 +1,61 @@
 # sock-n-cock
 
-Collaborative real-time text editor over WebSockets.
+Collaborative real-time text editor with Socket.IO, FastAPI, Monaco, and Kafka.
 
-## Structure
+## What It Does
 
-```
-.
-├── client/          # Frontend (TBD)
-└── server/
-    ├── pyproject.toml
-    └── src/
-        └── main.py  # WebSocket server entry point
-```
+- Multiple browser tabs can edit the same Monaco document in real time.
+- The browser talks to the backend over Socket.IO using the WebSocket transport.
+- Edit operations are published to Kafka and then replayed back through the server.
+- The server keeps an in-memory snapshot of each document so late joiners receive
+  the current content immediately instead of starting from an empty editor.
 
 ## Requirements
 
+- Docker
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) — package manager and runner
+- Node.js 18+ and npm
 
-## Setup
+## Project Layout
 
-```bash
-# Install uv (if not installed)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Install dependencies
-cd server
-uv sync
+```text
+.
+├── client/              # React + Vite + Monaco frontend
+├── server/              # FastAPI + Socket.IO + Kafka backend
+└── docker-compose.yml   # Kafka broker for edit distribution
 ```
 
-Kafka (Docker):
+## Launch
+
+1. Start Kafka from the project root:
 
 ```bash
 docker compose up -d
 ```
 
-Server:
+2. Install backend dependencies:
 
 ```bash
 cd server
 uv sync
 ```
 
-Client:
-
-```bash
-cd client
-npm install
-```
-Server:
+3. Start the backend on port `3001`:
 
 ```bash
 cd server/src
 uv run uvicorn main:app --reload --port 3001
 ```
 
-Client:
+4. In a second terminal, install frontend dependencies:
+
+```bash
+cd client
+npm install
+```
+
+5. Start the frontend on port `5173`:
 
 ```bash
 cd client
@@ -64,16 +64,21 @@ npm run dev
 
 Open [http://localhost:5173](http://localhost:5173) in multiple tabs to collaborate.
 
-## pyproject.toml
+## How To Use It
 
-Dependencies and metadata live in `server/pyproject.toml`. No `requirements.txt` needed — `uv.lock` pins exact versions.
+- Type in one tab and the edits should appear in the others.
+- Open a fresh tab after making edits; it should receive the current document
+  snapshot on join.
+- The left sidebar shows connected users and simple activity logs.
 
-```toml
-[project]
-name = "sock-n-cock"
-version = "0.1.0"
-requires-python = ">=3.11"
-dependencies = [
-    "websockets>=13.0",
-]
-```
+## Stop
+
+- Stop the frontend and backend with `Ctrl+C` in their terminals.
+- Stop Kafka with `docker compose down`.
+
+## Notes
+
+- The server depends on Kafka at `localhost:9092`; if Kafka is not running, the
+  backend will fail during startup.
+- Document state is kept in memory on the backend right now, so restarting the
+  server resets the shared document.

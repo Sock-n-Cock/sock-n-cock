@@ -24,6 +24,9 @@ client/dist/
 client/build/
 client/.next/
 client/out/
+node_modules/
+electron/dist/
+coverage/
 *.log
 npm-debug.log*
 yarn-debug.log*

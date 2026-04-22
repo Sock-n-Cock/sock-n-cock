@@ -1,7 +1,7 @@
-import { useRef, useState, useEffect } from 'react';
+import {useRef, useState, useEffect, type RefObject} from 'react';
 import { io } from "socket.io-client";
 import Editor, { type OnMount } from '@monaco-editor/react';
-import { editor } from 'monaco-editor';
+import type { editor, IRange } from 'monaco-editor';
 import { Users, Wifi, WifiOff, Activity } from 'lucide-react';
 
 const DOC_ID = 'main-room';
@@ -13,6 +13,9 @@ const socket = io('ws://localhost:3001', {
   autoConnect: true,
   reconnection: true,
 });
+
+type MonacoEditorInstance = Parameters<OnMount>[0];
+type MonacoInstance = Parameters<OnMount>[1];
 
 type User = {
   id: string;
@@ -34,15 +37,76 @@ type RemoteCursorData = {
   };
 };
 
+type ServerOp = {
+  docId: string;
+  userId: string;
+  text: string;
+  range: IRange;
+  version: number;
+};
+
+type DocumentState = {
+  docId: string;
+  content: string;
+  version: number;
+};
+
+function applySnapshotToEditor(
+  editorInstance: MonacoEditorInstance | null,
+  content: string,
+  isApplyingRemote: RefObject<boolean>
+) {
+  const model = editorInstance?.getModel();
+  if (!model) return false;
+
+  // `setValue` triggers Monaco change events, so mark the update as remote to
+  // avoid sending the server snapshot back as a new local edit.
+  isApplyingRemote.current = true;
+  try {
+    model.setValue(content);
+    return true;
+  } finally {
+    isApplyingRemote.current = false;
+  }
+}
+
+function applyRemoteOpToEditor(
+  editorInstance: MonacoEditorInstance | null,
+  op: ServerOp,
+  isApplyingRemote: RefObject<boolean>
+) {
+  const model = editorInstance?.getModel();
+  if (!model) return false;
+
+  // Remote operations also mutate the editor model, so guard against echoing
+  // them back to the server through `onChange`.
+  isApplyingRemote.current = true;
+  try {
+    model.applyEdits([{
+      range: op.range,
+      text: op.text,
+      forceMoveMarkers: true
+    }]);
+    return true;
+  } finally {
+    isApplyingRemote.current = false;
+  }
+}
+
 function App() {
-  const editorRef = useRef<Parameters<OnMount>[0]>(null);
-  const monacoRef = useRef<Parameters<OnMount>[1]>(null);
+  const editorRef = useRef<MonacoEditorInstance>(null);
+  const monacoRef = useRef<MonacoInstance>(null);
 
   const decorationsRef = useRef<Record<string, string[]>>({});
   const isApplyingRemote = useRef<boolean>(false);
+  const isHydratedRef = useRef(false);
+  const pendingSnapshotRef = useRef<DocumentState | null>(null);
+  const queuedRemoteOpsRef = useRef<ServerOp[]>([]);
+  const appliedVersionRef = useRef<number | null>(null);
 
   const [logs, setLogs] = useState<string[]>([]);
   const [isConnected, setIsConnected] = useState(socket.connected);
+  const [isHydrated, setIsHydrated] = useState(false);
   const [roomUsers, setRoomUsers] = useState<User[]>([]);
 
   const addLog = (msg : string) => setLogs(prev => [`${new Date().toLocaleTimeString()} - ${msg}`, ...prev].slice(0, 15));
@@ -58,14 +122,34 @@ function App() {
     }
   };
 
-  const handleEditorChange = (_value: string | undefined, event: { changes: editor.IModelContentChange[]; }) => {
-    if (isApplyingRemote.current || !socket.connected) return;
+  const handleEditorChange = (_value: string | undefined, event?: editor.IModelContentChangedEvent) => {
+    if (isApplyingRemote.current || !socket.connected || !isHydrated || !event) return;
     event.changes.forEach(change => {
       socket.emit('client-op', {
         docId: DOC_ID,
         text: change.text,
         range: change.range,
       });
+    });
+  };
+
+  const flushQueuedRemoteOps = (editorInstance: MonacoEditorInstance | null) => {
+    const currentVersion = appliedVersionRef.current;
+    if (!editorInstance || currentVersion === null) return;
+
+    // The snapshot establishes our baseline version. Any updates that arrived
+    // before hydration finishes are replayed only if they are newer than that.
+    const pendingOps = queuedRemoteOpsRef.current
+      .filter(op => op.userId !== socket.id && op.version > currentVersion)
+      .sort((left, right) => left.version - right.version);
+
+    queuedRemoteOpsRef.current = [];
+
+    pendingOps.forEach(op => {
+      if (applyRemoteOpToEditor(editorInstance, op, isApplyingRemote)) {
+        appliedVersionRef.current = op.version;
+        addLog(`Remote edit: ${op.userId.slice(0, 4)}`);
+      }
     });
   };
 
@@ -155,17 +239,41 @@ function App() {
   useEffect(() => {
     const onConnect = () => {
       setIsConnected(true);
+      setIsHydrated(false);
+      isHydratedRef.current = false;
+      pendingSnapshotRef.current = null;
+      appliedVersionRef.current = null;
+      queuedRemoteOpsRef.current = [];
       addLog('Connected to server');
       socket.emit('join', { docId: DOC_ID, userName: USER_NAME, color: USER_COLOR });
     };
 
     const onDisconnect = () => {
       setIsConnected(false);
+      setIsHydrated(false);
+      isHydratedRef.current = false;
+      pendingSnapshotRef.current = null;
+      appliedVersionRef.current = null;
+      queuedRemoteOpsRef.current = [];
       addLog('Disconnected from server');
     };
 
     socket.on('connect', onConnect);
     socket.on('disconnect', onDisconnect);
+
+    socket.on('document-state', (snapshot: DocumentState) => {
+      // The snapshot can arrive before Monaco finishes mounting, so keep a copy
+      // and hydrate immediately if the editor instance already exists.
+      pendingSnapshotRef.current = snapshot;
+      appliedVersionRef.current = snapshot.version;
+
+      if (applySnapshotToEditor(editorRef.current, snapshot.content, isApplyingRemote)) {
+        setIsHydrated(true);
+        isHydratedRef.current = true;
+        addLog(`Document synced: ${snapshot.docId}`);
+        flushQueuedRemoteOps(editorRef.current);
+      }
+    });
 
     socket.on('users-changed', (users : User[]) => {
       setRoomUsers(users);
@@ -182,20 +290,21 @@ function App() {
       addLog(`User left: ${userId.slice(0, 4)}`);
     });
 
-    socket.on('server-update', (op) => {
-      if (op.userId === socket.id || !editorRef.current) return;
+    socket.on('server-update', (op: ServerOp) => {
+      if (appliedVersionRef.current === null || !editorRef.current) {
+        queuedRemoteOpsRef.current.push(op);
+        return;
+      }
 
-      const model = editorRef.current.getModel();
-      if (!model) return;
+      if (op.version <= appliedVersionRef.current) return;
 
-      isApplyingRemote.current = true;
-      model.applyEdits([{
-        range: op.range,
-        text: op.text,
-        forceMoveMarkers: true
-      }]);
-      isApplyingRemote.current = false;
-      addLog(`Remote edit: ${op.userId.slice(0, 4)}`);
+      appliedVersionRef.current = op.version;
+
+      if (op.userId === socket.id) return;
+
+      if (applyRemoteOpToEditor(editorRef.current, op, isApplyingRemote)) {
+        addLog(`Remote edit: ${op.userId.slice(0, 4)}`);
+      }
     });
 
     socket.on('remote-cursor', (data) => {
@@ -205,6 +314,7 @@ function App() {
     return () => {
       socket.off('connect');
       socket.off('disconnect');
+      socket.off('document-state');
       socket.off('users-changed');
       socket.off('user-left');
       socket.off('server-update');
@@ -245,8 +355,19 @@ function App() {
             editorRef.current = editor;
             monacoRef.current = monaco;
 
+            // When the editor mounts after the socket handshake, hydrate it from
+            // the cached snapshot and then replay any newer queued operations.
+            if (pendingSnapshotRef.current) {
+              if (applySnapshotToEditor(editor, pendingSnapshotRef.current.content, isApplyingRemote)) {
+                appliedVersionRef.current = pendingSnapshotRef.current.version;
+                setIsHydrated(true);
+                isHydratedRef.current = true;
+                flushQueuedRemoteOps(editor);
+              }
+            }
+
             editor.onDidChangeCursorSelection((e) => {
-              if (!socket.connected) return;
+              if (!socket.connected || !isHydratedRef.current) return;
               socket.emit('cursor-move', {
                 docId: DOC_ID,
                 selection: e.selection,
@@ -258,8 +379,11 @@ function App() {
           onChange={handleEditorChange}
           options={{
             fontSize: 15,
+            padding: { top: 15, bottom: 15 },
             automaticLayout: true,
             cursorSmoothCaretAnimation: 'on',
+            // Prevent editing stale local text until the server snapshot arrives.
+            readOnly: !isHydrated,
           }}
         />
       </div>
