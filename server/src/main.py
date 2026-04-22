@@ -7,11 +7,13 @@ from kafka import KafkaManager
 kafka = KafkaManager()
 sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await kafka.start()
     yield
     await kafka.stop()
+
 
 fastapi_app = FastAPI(lifespan=lifespan)
 fastapi_app.add_middleware(
@@ -77,9 +79,11 @@ def _get_document(doc_id: str) -> dict[str, int | str]:
         documents[doc_id] = {"content": "", "version": 0}
     return documents[doc_id]
 
+
 @sio.event
 async def connect(sid, environ):
     print(f"Connected: {sid}")
+
 
 @sio.event
 async def disconnect(sid):
@@ -90,6 +94,7 @@ async def disconnect(sid):
             await sio.emit('user-left', sid, room=doc_id)
     print(f"Disconnected: {sid}")
 
+
 @sio.event
 async def join(sid, data):
     doc_id = data['docId']
@@ -98,36 +103,45 @@ async def join(sid, data):
         rooms[doc_id] = {}
     rooms[doc_id][sid] = {'id': sid, 'name': data['userName'], 'color': data['color']}
     document = _get_document(doc_id)
-    # Send the latest full snapshot first so late joiners render the current
-    # document before they start receiving incremental updates.
-    await sio.emit(
-        'document-state',
-        {
-            'docId': doc_id,
-            'content': document['content'],
-            'version': document['version'],
-        },
-        to=sid,
-    )
+
+    await sio.emit('document-state', {
+        'docId': doc_id,
+        'content': document['content'],
+        'version': document['version'],
+    }, to=sid)
     await sio.emit('users-changed', list(rooms[doc_id].values()), room=doc_id)
+
+
+@sio.event
+async def leave(sid, data):
+    doc_id = data.get('docId')
+    if doc_id:
+        await sio.leave_room(sid, doc_id)
+        if doc_id in rooms and sid in rooms[doc_id]:
+            del rooms[doc_id][sid]
+            await sio.emit('users-changed', list(rooms[doc_id].values()), room=doc_id)
+            await sio.emit('user-left', sid, room=doc_id)
+        print(f"User {sid} left room {doc_id}")
+
 
 @sio.on('client-op')
 async def client_op(sid, data):
     await kafka.produce(data['docId'], sid, data)
+
 
 @sio.on('cursor-move')
 async def cursor_move(sid, data):
     doc_id = data['docId']
     await sio.emit('remote-cursor', {**data, 'userId': sid}, room=doc_id, skip_sid=sid)
 
+
 async def broadcast_edit(doc_id: str, data: dict):
     # All edits flow through Kafka and then through this function. That gives the
     # server one ordered place to update the snapshot and assign the next version.
     document = _get_document(doc_id)
-    document['content'] = _apply_document_change(str(document['content']), data)
-    document['version'] = int(document['version']) + 1
-    await sio.emit(
-        'server-update',
-        {**data, 'version': document['version']},
-        room=doc_id,
-    )
+    try:
+        document['content'] = _apply_document_change(str(document['content']), data)
+        document['version'] = int(document['version']) + 1
+        await sio.emit('server-update', {**data, 'version': document['version']}, room=doc_id)
+    except Exception as e:
+        print(f"Error applying edit: {e}")
