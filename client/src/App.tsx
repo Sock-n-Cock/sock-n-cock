@@ -15,7 +15,6 @@ const socket = io('ws://localhost:3001', {
 });
 
 type MonacoEditorInstance = Parameters<OnMount>[0];
-
 type MonacoInstance = Parameters<OnMount>[1];
 
 type User = {
@@ -321,18 +320,6 @@ function App() {
       socket.off('server-update');
       socket.off('remote-cursor');
     };
-  }, []);
-
-  useEffect(() => {
-    if (socket.connected) {
-      setIsConnected(true);
-      setIsHydrated(false);
-      isHydratedRef.current = false;
-      pendingSnapshotRef.current = null;
-      appliedVersionRef.current = null;
-      queuedRemoteOpsRef.current = [];
-      socket.emit('join', { docId: DOC_ID, userName: USER_NAME, color: USER_COLOR });
-    }
   }, []);
 
   return (
