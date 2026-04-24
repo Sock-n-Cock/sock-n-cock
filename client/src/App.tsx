@@ -1,12 +1,18 @@
-import {useRef, useState, useEffect, type RefObject} from 'react';
-import { io } from "socket.io-client";
+import { useCallback, useEffect, useRef, useState, type RefObject } from 'react';
 import Editor, { type OnMount } from '@monaco-editor/react';
-import type { editor, IRange } from 'monaco-editor';
-import { Users, Wifi, WifiOff, Activity } from 'lucide-react';
+import type { editor } from 'monaco-editor';
+import { Activity, Users, Wifi, WifiOff } from 'lucide-react';
+import { io } from 'socket.io-client';
+
+import {
+  type LocalTextOperation,
+  type ServerTextOperation,
+  transformTextOperation,
+} from './operations';
 
 const DOC_ID = 'main-room';
 const USER_NAME = `User_${Math.floor(Math.random() * 1000)}`;
-const USER_COLOR = `#${Math.floor(Math.random()*16777215).toString(16).padStart(6, '0')}`;
+const USER_COLOR = `#${Math.floor(Math.random() * 16777215).toString(16).padStart(6, '0')}`;
 
 const socket = io('ws://localhost:3001', {
   transports: ['websocket'],
@@ -37,14 +43,6 @@ type RemoteCursorData = {
   };
 };
 
-type ServerOp = {
-  docId: string;
-  userId: string;
-  text: string;
-  range: IRange;
-  version: number;
-};
-
 type DocumentState = {
   docId: string;
   content: string;
@@ -54,13 +52,11 @@ type DocumentState = {
 function applySnapshotToEditor(
   editorInstance: MonacoEditorInstance | null,
   content: string,
-  isApplyingRemote: RefObject<boolean>
+  isApplyingRemote: RefObject<boolean>,
 ) {
   const model = editorInstance?.getModel();
   if (!model) return false;
 
-  // `setValue` triggers Monaco change events, so mark the update as remote to
-  // avoid sending the server snapshot back as a new local edit.
   isApplyingRemote.current = true;
   try {
     model.setValue(content);
@@ -70,23 +66,31 @@ function applySnapshotToEditor(
   }
 }
 
-function applyRemoteOpToEditor(
+function applyTextOpToEditor(
   editorInstance: MonacoEditorInstance | null,
-  op: ServerOp,
-  isApplyingRemote: RefObject<boolean>
+  operation: Pick<ServerTextOperation | LocalTextOperation, 'start' | 'end' | 'text'>,
+  isApplyingRemote: RefObject<boolean>,
 ) {
   const model = editorInstance?.getModel();
   if (!model) return false;
 
-  // Remote operations also mutate the editor model, so guard against echoing
-  // them back to the server through `onChange`.
+  const startPosition = model.getPositionAt(operation.start);
+  const endPosition = model.getPositionAt(operation.end);
+
   isApplyingRemote.current = true;
   try {
-    model.applyEdits([{
-      range: op.range,
-      text: op.text,
-      forceMoveMarkers: true
-    }]);
+    model.applyEdits([
+      {
+        range: {
+          startLineNumber: startPosition.lineNumber,
+          startColumn: startPosition.column,
+          endLineNumber: endPosition.lineNumber,
+          endColumn: endPosition.column,
+        },
+        text: operation.text,
+        forceMoveMarkers: true,
+      },
+    ]);
     return true;
   } finally {
     isApplyingRemote.current = false;
@@ -98,20 +102,26 @@ function App() {
   const monacoRef = useRef<MonacoInstance>(null);
 
   const decorationsRef = useRef<Record<string, string[]>>({});
-  const isApplyingRemote = useRef<boolean>(false);
+  const isApplyingRemote = useRef(false);
   const isHydratedRef = useRef(false);
   const pendingSnapshotRef = useRef<DocumentState | null>(null);
-  const queuedRemoteOpsRef = useRef<ServerOp[]>([]);
-  const appliedVersionRef = useRef<number | null>(null);
+  const queuedRemoteOpsRef = useRef<ServerTextOperation[]>([]);
+  const pendingLocalOpsRef = useRef<LocalTextOperation[]>([]);
+  const serverVersionRef = useRef<number | null>(null);
+  const nextOpIdRef = useRef(0);
 
   const [logs, setLogs] = useState<string[]>([]);
   const [isConnected, setIsConnected] = useState(socket.connected);
   const [isHydrated, setIsHydrated] = useState(false);
   const [roomUsers, setRoomUsers] = useState<User[]>([]);
 
-  const addLog = (msg : string) => setLogs(prev => [`${new Date().toLocaleTimeString()} - ${msg}`, ...prev].slice(0, 15));
+  const addLog = useCallback(
+    (message: string) =>
+      setLogs((prev) => [`${new Date().toLocaleTimeString()} - ${message}`, ...prev].slice(0, 15)),
+    [],
+  );
 
-  const removeUserDecorations = (userId : string) => {
+  const removeUserDecorations = (userId: string) => {
     if (editorRef.current && decorationsRef.current[userId]) {
       editorRef.current.deltaDecorations(decorationsRef.current[userId], []);
       delete decorationsRef.current[userId];
@@ -122,34 +132,69 @@ function App() {
     }
   };
 
+  const processServerOp = useCallback((
+    operation: ServerTextOperation,
+    editorInstance: MonacoEditorInstance | null,
+  ) => {
+    const serverVersion = serverVersionRef.current;
+    if (!editorInstance || serverVersion === null || operation.version <= serverVersion) return;
+
+    if (operation.userId === socket.id) {
+      pendingLocalOpsRef.current = pendingLocalOpsRef.current.filter(
+        (pendingOperation) => pendingOperation.opId !== operation.opId,
+      );
+      serverVersionRef.current = operation.version;
+      return;
+    }
+
+    let rebasedRemoteOperation = operation;
+    pendingLocalOpsRef.current.forEach((pendingOperation) => {
+      rebasedRemoteOperation = transformTextOperation(
+        rebasedRemoteOperation,
+        pendingOperation,
+        'before',
+      );
+    });
+
+    if (applyTextOpToEditor(editorInstance, rebasedRemoteOperation, isApplyingRemote)) {
+      pendingLocalOpsRef.current = pendingLocalOpsRef.current.map((pendingOperation) =>
+        transformTextOperation(pendingOperation, operation, 'after'),
+      );
+      serverVersionRef.current = operation.version;
+      addLog(`Remote edit: ${operation.userId.slice(0, 4)}`);
+    }
+  }, [addLog]);
+
+  const flushQueuedRemoteOps = useCallback((editorInstance: MonacoEditorInstance | null) => {
+    if (!editorInstance || serverVersionRef.current === null) return;
+
+    const queuedOps = [...queuedRemoteOpsRef.current].sort((left, right) => left.version - right.version);
+    queuedRemoteOpsRef.current = [];
+    queuedOps.forEach((operation) => {
+      processServerOp(operation, editorInstance);
+    });
+  }, [processServerOp]);
+
   const handleEditorChange = (_value: string | undefined, event?: editor.IModelContentChangedEvent) => {
     if (isApplyingRemote.current || !socket.connected || !isHydrated || !event) return;
-    event.changes.forEach(change => {
-      socket.emit('client-op', {
+
+    const baseVersion = (serverVersionRef.current ?? 0) + pendingLocalOpsRef.current.length;
+
+    // Monaco reports multi-cursor changes from the end of the document, so
+    // preserving the event order keeps later queued ops aligned with the model.
+    event.changes.forEach((change, index) => {
+      const operation: LocalTextOperation = {
         docId: DOC_ID,
+        opId: `${socket.id ?? 'offline'}-${nextOpIdRef.current}`,
         text: change.text,
-        range: change.range,
-      });
-    });
-  };
+        start: change.rangeOffset,
+        end: change.rangeOffset + change.rangeLength,
+        baseVersion: baseVersion + index,
+      };
 
-  const flushQueuedRemoteOps = (editorInstance: MonacoEditorInstance | null) => {
-    const currentVersion = appliedVersionRef.current;
-    if (!editorInstance || currentVersion === null) return;
-
-    // The snapshot establishes our baseline version. Any updates that arrived
-    // before hydration finishes are replayed only if they are newer than that.
-    const pendingOps = queuedRemoteOpsRef.current
-      .filter(op => op.userId !== socket.id && op.version > currentVersion)
-      .sort((left, right) => left.version - right.version);
-
-    queuedRemoteOpsRef.current = [];
-
-    pendingOps.forEach(op => {
-      if (applyRemoteOpToEditor(editorInstance, op, isApplyingRemote)) {
-        appliedVersionRef.current = op.version;
-        addLog(`Remote edit: ${op.userId.slice(0, 4)}`);
-      }
+      nextOpIdRef.current += 1;
+      pendingLocalOpsRef.current.push(operation);
+      socket.emit('client-op', operation);
     });
   };
 
@@ -161,17 +206,20 @@ function App() {
     const safeId = userId.replace(/[^a-z0-9]/gi, '');
     const newDecorations = [];
 
-    if (selection.startLineNumber !== selection.endLineNumber || selection.startColumn !== selection.endColumn) {
+    if (
+      selection.startLineNumber !== selection.endLineNumber ||
+      selection.startColumn !== selection.endColumn
+    ) {
       newDecorations.push({
         range: new monacoRef.current.Range(
           selection.startLineNumber,
           selection.startColumn,
           selection.endLineNumber,
-          selection.endColumn
+          selection.endColumn,
         ),
         options: {
           className: `remote-selection-${safeId}`,
-        }
+        },
       });
     }
 
@@ -180,12 +228,12 @@ function App() {
         selection.positionLineNumber,
         selection.positionColumn,
         selection.positionLineNumber,
-        selection.positionColumn
+        selection.positionColumn,
       ),
       options: {
         className: `remote-cursor-${safeId}`,
-        stickiness: monacoRef.current.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges
-      }
+        stickiness: monacoRef.current.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+      },
     });
 
     if (!document.getElementById(`style-${safeId}`)) {
@@ -216,7 +264,7 @@ function App() {
           pointer-events: none;
           transition: opacity 0.2s ease-in-out;
           font-family: sans-serif;
-          box-shadow: 0px 2px 4px rgba(0,0,0,0.2);
+          box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
         }
 
         .remote-cursor-${safeId}:hover::before {
@@ -232,7 +280,7 @@ function App() {
 
     decorationsRef.current[userId] = editorRef.current.deltaDecorations(
       decorationsRef.current[userId] || [],
-      newDecorations
+      newDecorations,
     );
   };
 
@@ -242,8 +290,9 @@ function App() {
       setIsHydrated(false);
       isHydratedRef.current = false;
       pendingSnapshotRef.current = null;
-      appliedVersionRef.current = null;
       queuedRemoteOpsRef.current = [];
+      pendingLocalOpsRef.current = [];
+      serverVersionRef.current = null;
       addLog('Connected to server');
       socket.emit('join', { docId: DOC_ID, userName: USER_NAME, color: USER_COLOR });
     };
@@ -253,8 +302,9 @@ function App() {
       setIsHydrated(false);
       isHydratedRef.current = false;
       pendingSnapshotRef.current = null;
-      appliedVersionRef.current = null;
       queuedRemoteOpsRef.current = [];
+      pendingLocalOpsRef.current = [];
+      serverVersionRef.current = null;
       addLog('Disconnected from server');
     };
 
@@ -262,10 +312,8 @@ function App() {
     socket.on('disconnect', onDisconnect);
 
     socket.on('document-state', (snapshot: DocumentState) => {
-      // The snapshot can arrive before Monaco finishes mounting, so keep a copy
-      // and hydrate immediately if the editor instance already exists.
       pendingSnapshotRef.current = snapshot;
-      appliedVersionRef.current = snapshot.version;
+      serverVersionRef.current = snapshot.version;
 
       if (applySnapshotToEditor(editorRef.current, snapshot.content, isApplyingRemote)) {
         setIsHydrated(true);
@@ -275,39 +323,31 @@ function App() {
       }
     });
 
-    socket.on('users-changed', (users : User[]) => {
+    socket.on('users-changed', (users: User[]) => {
       setRoomUsers(users);
-      const activeIds = users.map((u : User) => u.id);
-      Object.keys(decorationsRef.current).forEach(id => {
+      const activeIds = users.map((user) => user.id);
+      Object.keys(decorationsRef.current).forEach((id) => {
         if (!activeIds.includes(id) && id !== socket.id) {
           removeUserDecorations(id);
         }
       });
     });
 
-    socket.on('user-left', (userId : string) => {
+    socket.on('user-left', (userId: string) => {
       removeUserDecorations(userId);
       addLog(`User left: ${userId.slice(0, 4)}`);
     });
 
-    socket.on('server-update', (op: ServerOp) => {
-      if (appliedVersionRef.current === null || !editorRef.current) {
-        queuedRemoteOpsRef.current.push(op);
+    socket.on('server-update', (operation: ServerTextOperation) => {
+      if (serverVersionRef.current === null || !editorRef.current) {
+        queuedRemoteOpsRef.current.push(operation);
         return;
       }
 
-      if (op.version <= appliedVersionRef.current) return;
-
-      appliedVersionRef.current = op.version;
-
-      if (op.userId === socket.id) return;
-
-      if (applyRemoteOpToEditor(editorRef.current, op, isApplyingRemote)) {
-        addLog(`Remote edit: ${op.userId.slice(0, 4)}`);
-      }
+      processServerOp(operation, editorRef.current);
     });
 
-    socket.on('remote-cursor', (data) => {
+    socket.on('remote-cursor', (data: RemoteCursorData) => {
       updateRemoteCursor(data);
     });
 
@@ -320,29 +360,86 @@ function App() {
       socket.off('server-update');
       socket.off('remote-cursor');
     };
-  }, []);
+  }, [addLog, flushQueuedRemoteOps, processServerOp]);
 
   return (
-    <div style={{ display: 'flex', height: '100vh', backgroundColor: '#1e1e1e', color: 'white', overflow: 'hidden' }}>
-      <div style={{ width: '260px', borderRight: '1px solid #333', padding: '15px', display: 'flex', flexDirection: 'column' }}>
-        <div style={{ marginBottom: '20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+    <div
+      style={{
+        display: 'flex',
+        height: '100vh',
+        backgroundColor: '#1e1e1e',
+        color: 'white',
+        overflow: 'hidden',
+      }}
+    >
+      <div
+        style={{
+          width: '260px',
+          borderRight: '1px solid #333',
+          padding: '15px',
+          display: 'flex',
+          flexDirection: 'column',
+        }}
+      >
+        <div
+          style={{
+            marginBottom: '20px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+          }}
+        >
           <h3 style={{ margin: 0, fontSize: '18px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <Users size={20}/> People
+            <Users size={20} /> People
           </h3>
-          {isConnected ? <Wifi size={18} color="#4caf50"/> : <WifiOff size={18} color="#f44336"/>}
+          {isConnected ? <Wifi size={18} color="#4caf50" /> : <WifiOff size={18} color="#f44336" />}
         </div>
+
         <div style={{ flex: 1, overflowY: 'auto' }}>
-          {roomUsers.map(u => (
-            <div key={u.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 0', color: u.id === socket.id ? '#fff' : '#ccc' }}>
-              <div style={{ width: '10px', height: '10px', borderRadius: '50%', backgroundColor: u.color }}></div>
-              <span style={{ fontSize: '14px' }}>{u.name} {u.id === socket.id ? '(You)' : ''}</span>
+          {roomUsers.map((user) => (
+            <div
+              key={user.id}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                padding: '6px 0',
+                color: user.id === socket.id ? '#fff' : '#ccc',
+              }}
+            >
+              <div
+                style={{
+                  width: '10px',
+                  height: '10px',
+                  borderRadius: '50%',
+                  backgroundColor: user.color,
+                }}
+              />
+              <span style={{ fontSize: '14px' }}>
+                {user.name} {user.id === socket.id ? '(You)' : ''}
+              </span>
             </div>
           ))}
         </div>
+
         <div style={{ height: '200px', borderTop: '1px solid #333', paddingTop: '10px' }}>
-          <h3 style={{ fontSize: '14px', color: '#888', display: 'flex', alignItems: 'center', gap: '8px' }}><Activity size={16}/> Logs</h3>
-          <div style={{ fontSize: '11px', color: '#666', height: '160px', overflowY: 'auto', fontFamily: 'monospace' }}>
-            {logs.map((l, i) => <div key={i} style={{ padding: '2px 0' }}>{l}</div>)}
+          <h3 style={{ fontSize: '14px', color: '#888', display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <Activity size={16} /> Logs
+          </h3>
+          <div
+            style={{
+              fontSize: '11px',
+              color: '#666',
+              height: '160px',
+              overflowY: 'auto',
+              fontFamily: 'monospace',
+            }}
+          >
+            {logs.map((logEntry, index) => (
+              <div key={index} style={{ padding: '2px 0' }}>
+                {logEntry}
+              </div>
+            ))}
           </div>
         </div>
       </div>
@@ -351,28 +448,32 @@ function App() {
         <Editor
           theme="vs-dark"
           language="javascript"
-          onMount={(editor, monaco) => {
-            editorRef.current = editor;
-            monacoRef.current = monaco;
+          onMount={(editorInstance, monacoInstance) => {
+            editorRef.current = editorInstance;
+            monacoRef.current = monacoInstance;
 
-            // When the editor mounts after the socket handshake, hydrate it from
-            // the cached snapshot and then replay any newer queued operations.
             if (pendingSnapshotRef.current) {
-              if (applySnapshotToEditor(editor, pendingSnapshotRef.current.content, isApplyingRemote)) {
-                appliedVersionRef.current = pendingSnapshotRef.current.version;
+              if (
+                applySnapshotToEditor(
+                  editorInstance,
+                  pendingSnapshotRef.current.content,
+                  isApplyingRemote,
+                )
+              ) {
+                serverVersionRef.current = pendingSnapshotRef.current.version;
                 setIsHydrated(true);
                 isHydratedRef.current = true;
-                flushQueuedRemoteOps(editor);
+                flushQueuedRemoteOps(editorInstance);
               }
             }
 
-            editor.onDidChangeCursorSelection((e) => {
+            editorInstance.onDidChangeCursorSelection((selectionEvent) => {
               if (!socket.connected || !isHydratedRef.current) return;
               socket.emit('cursor-move', {
                 docId: DOC_ID,
-                selection: e.selection,
+                selection: selectionEvent.selection,
                 name: USER_NAME,
-                color: USER_COLOR
+                color: USER_COLOR,
               });
             });
           }}
@@ -382,7 +483,6 @@ function App() {
             padding: { top: 15, bottom: 15 },
             automaticLayout: true,
             cursorSmoothCaretAnimation: 'on',
-            // Prevent editing stale local text until the server snapshot arrives.
             readOnly: !isHydrated,
           }}
         />

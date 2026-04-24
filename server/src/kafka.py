@@ -11,8 +11,6 @@ class KafkaManager:
         self.consumer = None
 
     async def start(self):
-        # The producer publishes editor operations; the consumer replays them back
-        # into the server so every client observes the same ordered stream.
         self.producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BROKER)
         await self.producer.start()
 
@@ -33,7 +31,6 @@ class KafkaManager:
         await self.producer.send(TOPIC, value=payload, key=doc_id.encode())
 
     async def _consume_loop(self):
-        # Import lazily to avoid a module-level circular import with main.py.
         from main import broadcast_edit
         async for msg in self.consumer:
             data = json.loads(msg.value.decode())
