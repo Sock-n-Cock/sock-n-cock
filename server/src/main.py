@@ -2,6 +2,7 @@ import socketio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from collab import AppliedOperation, apply_operation, rebase_operation
 from kafka import KafkaManager
 
 kafka = KafkaManager()
@@ -27,57 +28,24 @@ fastapi_app.add_middleware(
 app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app)
 
 # `rooms` stores presence metadata, while `documents` is the authoritative
-# server-side snapshot used when a client joins after edits already happened.
+# server-side snapshot and operation history used to rebase stale edits.
 rooms: dict[str, dict] = {}
-documents: dict[str, dict[str, int | str]] = {}
+documents: dict[str, dict] = {}
 
 
-def _position_to_index(text: str, line_number: int, column: int) -> int:
-    if line_number < 1 or column < 1:
-        raise ValueError("Line and column numbers must be 1-based.")
-
-    current_line = 1
-    current_column = 1
-
-    for index, char in enumerate(text):
-        if current_line == line_number and current_column == column:
-            return index
-
-        if char == "\n":
-            current_line += 1
-            current_column = 1
-        else:
-            current_column += 1
-
-    if current_line == line_number and current_column == column:
-        return len(text)
-
-    raise ValueError(
-        f"Position ({line_number}, {column}) is outside the current document."
-    )
-
-
-def _apply_document_change(content: str, change: dict) -> str:
-    # Monaco ranges are line/column based, but the server snapshot is plain text.
-    # Convert the incoming range into string offsets before patching the document.
-    range_data = change["range"]
-    start_index = _position_to_index(
-        content,
-        range_data["startLineNumber"],
-        range_data["startColumn"],
-    )
-    end_index = _position_to_index(
-        content,
-        range_data["endLineNumber"],
-        range_data["endColumn"],
-    )
-    return f"{content[:start_index]}{change['text']}{content[end_index:]}"
-
-
-def _get_document(doc_id: str) -> dict[str, int | str]:
+def _get_document(doc_id: str) -> dict:
     if doc_id not in documents:
-        documents[doc_id] = {"content": "", "version": 0}
+        documents[doc_id] = {"content": "", "version": 0, "history": []}
     return documents[doc_id]
+
+
+async def _emit_document_state(doc_id: str, target_sid: str):
+    document = _get_document(doc_id)
+    await sio.emit('document-state', {
+        'docId': doc_id,
+        'content': document['content'],
+        'version': document['version'],
+    }, to=target_sid)
 
 
 @sio.event
@@ -102,13 +70,7 @@ async def join(sid, data):
     if doc_id not in rooms:
         rooms[doc_id] = {}
     rooms[doc_id][sid] = {'id': sid, 'name': data['userName'], 'color': data['color']}
-    document = _get_document(doc_id)
-
-    await sio.emit('document-state', {
-        'docId': doc_id,
-        'content': document['content'],
-        'version': document['version'],
-    }, to=sid)
+    await _emit_document_state(doc_id, sid)
     await sio.emit('users-changed', list(rooms[doc_id].values()), room=doc_id)
 
 
@@ -140,8 +102,29 @@ async def broadcast_edit(doc_id: str, data: dict):
     # server one ordered place to update the snapshot and assign the next version.
     document = _get_document(doc_id)
     try:
-        document['content'] = _apply_document_change(str(document['content']), data)
-        document['version'] = int(document['version']) + 1
-        await sio.emit('server-update', {**data, 'version': document['version']}, room=doc_id)
-    except Exception as e:
-        print(f"Error applying edit: {e}")
+        base_version = int(data['baseVersion'])
+        current_version = int(document['version'])
+
+        if base_version < 0 or base_version > current_version:
+            raise ValueError(
+                f"Client edit references invalid version {base_version}, current version is {current_version}."
+            )
+
+        history: list[AppliedOperation] = document['history']
+        rebased = rebase_operation(data, history[base_version:])
+
+        document['content'] = apply_operation(str(document['content']), rebased)
+        document['version'] = current_version + 1
+
+        applied: AppliedOperation = {
+            **rebased,
+            'version': int(document['version']),
+        }
+        history.append(applied)
+
+        await sio.emit('server-update', applied, room=doc_id)
+    except ValueError as e:
+        print(f"Discarding invalid edit for {doc_id}: {e}")
+        user_id = data.get('userId')
+        if user_id:
+            await _emit_document_state(doc_id, user_id)

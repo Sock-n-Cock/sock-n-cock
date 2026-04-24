@@ -6,8 +6,9 @@ import { Terminal } from 'lucide-react';
 
 import './App.css';
 import { Sidebar } from './components/Sidebar';
+import { rebasePendingOperations } from './collab';
 import { generateSafeId, getTrimmedLogs, generateUserCredentials } from './utils';
-import type { User, RemoteCursorData, ServerOp, DocumentState } from './types';
+import type { User, RemoteCursorData, ServerOp, DocumentState, PendingClientOp } from './types';
 
 const socket = io('ws://localhost:3001', {
   transports: ['websocket'],
@@ -23,6 +24,8 @@ type MonacoEditorInstance = Parameters<OnMount>[0];
 type MonacoInstance = Parameters<OnMount>[1];
 
 const { name: USER_NAME, color: USER_COLOR } = generateUserCredentials();
+
+const createOpId = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 function applySnapshotToEditor(
   editorInstance: MonacoEditorInstance | null,
@@ -51,11 +54,23 @@ function applyRemoteOpToEditor(
   const model = editorInstance?.getModel();
   if (!model) return false;
 
+  const start = model.getPositionAt(op.start);
+  const end = model.getPositionAt(op.end);
+
   // Remote operations also mutate the editor model, so guard against echoing
   // them back to the server through `onChange`.
   isApplyingRemote.current = true;
   try {
-    model.applyEdits([{ range: op.range, text: op.text, forceMoveMarkers: true }]);
+    model.applyEdits([{
+      range: {
+        startLineNumber: start.lineNumber,
+        startColumn: start.column,
+        endLineNumber: end.lineNumber,
+        endColumn: end.column,
+      },
+      text: op.text,
+      forceMoveMarkers: true
+    }]);
     return true;
   } finally {
     isApplyingRemote.current = false;
@@ -72,7 +87,8 @@ function App() {
   const isHydratedRef = useRef(false);
   const pendingSnapshotRef = useRef<DocumentState | null>(null);
   const queuedRemoteOpsRef = useRef<ServerOp[]>([]);
-  const appliedVersionRef = useRef<number | null>(null);
+  const pendingLocalOpsRef = useRef<PendingClientOp[]>([]);
+  const serverVersionRef = useRef<number | null>(null);
 
   const [docId, setDocId] = useState('main-room');
   const [logs, setLogs] = useState<string[]>([]);
@@ -85,6 +101,13 @@ function App() {
     docIdRef.current = docId;
   }, [docId]);
 
+  const resetSyncState = () => {
+    pendingSnapshotRef.current = null;
+    queuedRemoteOpsRef.current = [];
+    pendingLocalOpsRef.current = [];
+    serverVersionRef.current = null;
+  };
+
   const joinRoom = (newRoomId: string) => {
     if (newRoomId === docId) return;
     socket.emit('leave', { docId });
@@ -93,6 +116,7 @@ function App() {
     setRoomUsers([]);
     setIsHydrated(false);
     isHydratedRef.current = false;
+    resetSyncState();
 
     addLog(`Joining room: ${newRoomId}`);
     socket.emit('join', { docId: newRoomId, userName: USER_NAME, color: USER_COLOR });
@@ -108,31 +132,71 @@ function App() {
     }
   };
 
-  const handleEditorChange = (_value: string | undefined, event?: editor.IModelContentChangedEvent) => {
-    if (isApplyingRemote.current || !socket.connected || !isHydrated || !event) return;
-    event.changes.forEach(change => {
-      socket.emit('client-op', { docId: docIdRef.current, text: change.text, range: change.range });
+  const sendNextPendingOp = () => {
+    const currentVersion = serverVersionRef.current;
+    const nextOp = pendingLocalOpsRef.current[0];
+
+    if (!socket.connected || !isHydratedRef.current || currentVersion === null || !nextOp || nextOp.sent) {
+      return;
+    }
+
+    nextOp.sent = true;
+    socket.emit('client-op', {
+      docId: nextOp.docId,
+      opId: nextOp.opId,
+      start: nextOp.start,
+      end: nextOp.end,
+      text: nextOp.text,
+      baseVersion: currentVersion,
     });
   };
 
+  const handleEditorChange = (_value: string | undefined, event?: editor.IModelContentChangedEvent) => {
+    if (isApplyingRemote.current || !socket.connected || !isHydrated || !event) return;
+
+    const pendingOps = [...event.changes]
+      .sort((left, right) => right.rangeOffset - left.rangeOffset)
+      .map<PendingClientOp>(change => ({
+        docId: docIdRef.current,
+        opId: createOpId(),
+        start: change.rangeOffset,
+        end: change.rangeOffset + change.rangeLength,
+        text: change.text,
+        sent: false,
+      }));
+
+    pendingLocalOpsRef.current = [...pendingLocalOpsRef.current, ...pendingOps];
+    sendNextPendingOp();
+  };
+
   const flushQueuedRemoteOps = (editorInstance: MonacoEditorInstance | null) => {
-    const currentVersion = appliedVersionRef.current;
+    const currentVersion = serverVersionRef.current;
     if (!editorInstance || currentVersion === null) return;
 
     // The snapshot establishes our baseline version. Any updates that arrived
     // before hydration finishes are replayed only if they are newer than that.
     const pendingOps = queuedRemoteOpsRef.current
-      .filter(op => op.userId !== socket.id && op.version > currentVersion)
+      .filter(op => op.version > currentVersion)
       .sort((left, right) => left.version - right.version);
 
     queuedRemoteOpsRef.current = [];
 
     pendingOps.forEach(op => {
-      if (applyRemoteOpToEditor(editorInstance, op, isApplyingRemote)) {
-        appliedVersionRef.current = op.version;
-        addLog(`Remote edit: ${op.userId.slice(0, 4)}`);
+      serverVersionRef.current = op.version;
+
+      if (op.userId === socket.id) {
+        pendingLocalOpsRef.current = pendingLocalOpsRef.current.filter(localOp => localOp.opId !== op.opId);
+      } else {
+        const rebased = rebasePendingOperations(pendingLocalOpsRef.current, op);
+        pendingLocalOpsRef.current = rebased.pending;
+
+        if (applyRemoteOpToEditor(editorInstance, rebased.remote, isApplyingRemote)) {
+          addLog(`Remote edit: ${op.userId.slice(0, 4)}`);
+        }
       }
     });
+
+    sendNextPendingOp();
   };
 
   const updateRemoteCursor = (data: RemoteCursorData) => {
@@ -184,6 +248,7 @@ function App() {
       setIsConnected(false);
       setIsHydrated(false);
       isHydratedRef.current = false;
+      resetSyncState();
       addLog('Disconnected from server');
     };
 
@@ -198,7 +263,7 @@ function App() {
       // The snapshot can arrive before Monaco finishes mounting, so keep a copy
       // and hydrate immediately if the editor instance already exists.
       pendingSnapshotRef.current = snapshot;
-      appliedVersionRef.current = snapshot.version;
+      serverVersionRef.current = snapshot.version;
 
       if (applySnapshotToEditor(editorRef.current, snapshot.content, isApplyingRemote)) {
         setIsHydrated(true);
@@ -222,18 +287,25 @@ function App() {
     });
 
     socket.on('server-update', (op: ServerOp) => {
-      if (appliedVersionRef.current === null || !editorRef.current) {
+      if (serverVersionRef.current === null || !editorRef.current) {
         queuedRemoteOpsRef.current.push(op);
         return;
       }
 
-      if (op.version <= appliedVersionRef.current) return;
+      if (op.version <= serverVersionRef.current) return;
 
-      appliedVersionRef.current = op.version;
+      serverVersionRef.current = op.version;
 
-      if (op.userId === socket.id) return;
+      if (op.userId === socket.id) {
+        pendingLocalOpsRef.current = pendingLocalOpsRef.current.filter(localOp => localOp.opId !== op.opId);
+        sendNextPendingOp();
+        return;
+      }
 
-      if (applyRemoteOpToEditor(editorRef.current, op, isApplyingRemote)) {
+      const rebased = rebasePendingOperations(pendingLocalOpsRef.current, op);
+      pendingLocalOpsRef.current = rebased.pending;
+
+      if (applyRemoteOpToEditor(editorRef.current, rebased.remote, isApplyingRemote)) {
         addLog(`Remote edit: ${op.userId.slice(0, 4)}`);
       }
     });
@@ -249,6 +321,9 @@ function App() {
       socket.off('server-update');
       socket.off('remote-cursor');
     };
+  // Socket listeners are intentionally registered once and read the latest
+  // collaboration state through refs.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
@@ -274,7 +349,7 @@ function App() {
               monacoRef.current = monaco;
               if (pendingSnapshotRef.current) {
                 if (applySnapshotToEditor(editor, pendingSnapshotRef.current.content, isApplyingRemote)) {
-                  appliedVersionRef.current = pendingSnapshotRef.current.version;
+                  serverVersionRef.current = pendingSnapshotRef.current.version;
                   setIsHydrated(true);
                   isHydratedRef.current = true;
                   flushQueuedRemoteOps(editor);
