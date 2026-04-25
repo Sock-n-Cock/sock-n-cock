@@ -29,9 +29,6 @@ fastapi_app.add_middleware(
 
 app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app)
 
-# `rooms` stores presence metadata, while `documents` is the authoritative
-# server-side snapshot and operation history used to rebase stale edits.
-rooms: dict[str, dict] = {}
 documents: dict[str, dict] = {}
 
 
@@ -57,61 +54,97 @@ async def connect(sid, environ):
 
 @sio.event
 async def disconnect(sid):
-    doc_id = await redis_manager.remove_user(sid)
+    try:
+        doc_id = await redis_manager.remove_user(sid)
 
-    if doc_id:
-        users = await redis_manager.get_users(doc_id)
-        await sio.emit('users-changed', users, room=doc_id)
-        await sio.emit('user-left', sid, room=doc_id)
+        if doc_id:
+            users = await redis_manager.get_users(doc_id)
+            await sio.emit('users-changed', users, room=doc_id)
+            await sio.emit('user-left', sid, room=doc_id)
+            await sio.leave_room(sid, doc_id)
+            print(f"User {sid} removed from doc {doc_id}")
+    except Exception as e:
+        print(f"Error in disconnect for {sid}: {e}")
 
     print(f"Disconnected: {sid}")
 
 
 @sio.event
 async def join(sid, data):
-    doc_id = data['docId']
-    await sio.enter_room(sid, doc_id)
+    try:
+        doc_id = data['docId']
 
-    user_data = {
-        'id': sid,
-        'name': data['userName'],
-        'color': data['color']
-    }
+        existing_users = await redis_manager.get_users(doc_id)
+        if any(user['id'] == sid for user in existing_users):
+            await sio.enter_room(sid, doc_id)
+            await _emit_document_state(doc_id, sid)
+            return
 
-    await redis_manager.add_user(doc_id, sid, user_data)
+        await sio.enter_room(sid, doc_id)
 
-    users = await redis_manager.get_users(doc_id)
-    await sio.emit('users-changed', users, room=doc_id)
+        user_data = {
+            'id': sid,
+            'name': data['userName'],
+            'color': data['color']
+        }
+
+        await redis_manager.add_user(doc_id, sid, user_data)
+
+        users = await redis_manager.get_users(doc_id)
+
+        await sio.emit('users-changed', users, room=doc_id)
+
+        await _emit_document_state(doc_id, sid)
+
+        print(f"User {sid} ({data['userName']}) joined doc {doc_id}")
+
+    except Exception as e:
+        print(f"Error in join for {sid}: {e}")
+        await sio.emit('error', {'message': 'Failed to join document'}, to=sid)
 
 
 @sio.event
 async def leave(sid, data):
-    doc_id = data.get('docId')
-    if doc_id:
-        await sio.leave_room(sid, doc_id)
-        if doc_id in rooms and sid in rooms[doc_id]:
-            del rooms[doc_id][sid]
-            await sio.emit('users-changed', list(rooms[doc_id].values()), room=doc_id)
+    try:
+        doc_id = data.get('docId')
+        if not doc_id:
+            return
+
+        removed_doc_id = await redis_manager.remove_user(sid)
+
+        if removed_doc_id == doc_id:
+            users = await redis_manager.get_users(doc_id)
+            await sio.emit('users-changed', users, room=doc_id)
             await sio.emit('user-left', sid, room=doc_id)
+
+        await sio.leave_room(sid, doc_id)
         print(f"User {sid} left room {doc_id}")
+
+    except Exception as e:
+        print(f"Error in leave for {sid}: {e}")
 
 
 @sio.on('client-op')
 async def client_op(sid, data):
-    await kafka.produce(data['docId'], sid, data)
+    try:
+        await kafka.produce(data['docId'], sid, data)
+    except Exception as e:
+        print(f"Error producing to Kafka: {e}")
+        await sio.emit('error', {'message': 'Failed to process operation'}, to=sid)
 
 
 @sio.on('cursor-move')
 async def cursor_move(sid, data):
-    doc_id = data['docId']
-    await sio.emit('remote-cursor', {**data, 'userId': sid}, room=doc_id, skip_sid=sid)
+    try:
+        doc_id = data['docId']
+        await sio.emit('remote-cursor', {**data, 'userId': sid}, room=doc_id, skip_sid=sid)
+    except Exception as e:
+        print(f"Error in cursor-move: {e}")
 
 
 async def broadcast_edit(doc_id: str, data: IncomingOperation):
-    # All edits flow through Kafka and then through this function. That gives the
-    # server one ordered place to update the snapshot and assign the next version.
-    document = _get_document(doc_id)
     try:
+        document = _get_document(doc_id)
         base_version = int(data['baseVersion'])
         current_version = int(document['version'])
 
@@ -133,8 +166,11 @@ async def broadcast_edit(doc_id: str, data: IncomingOperation):
         history.append(applied)
 
         await sio.emit('server-update', applied, room=doc_id)
+
     except ValueError as e:
         print(f"Discarding invalid edit for {doc_id}: {e}")
         user_id = data.get('userId')
         if user_id:
             await _emit_document_state(doc_id, user_id)
+    except Exception as e:
+        print(f"Error in broadcast_edit: {e}")
