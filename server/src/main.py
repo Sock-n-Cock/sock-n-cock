@@ -6,6 +6,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from collab import AppliedOperation, apply_operation, rebase_operation, IncomingOperation
 from kafka import KafkaManager
 import asyncio
+from pymongo.errors import DuplicateKeyError
 
 
 MONGO_URL = "mongodb://localhost:27017"
@@ -88,8 +89,12 @@ async def _get_document(doc_id: str):
             documents[doc_id] = new_doc
             try:
                 await documents_collection.insert_one(new_doc)
-            except Exception as e:
+            except DuplicateKeyError:
+                # Документ уже был создан параллельно другим запросом/воркером.
                 pass
+            except Exception as e:
+                print(f"Failed to insert document {doc_id}: {e}")
+                raise
     return documents[doc_id]
 
 
