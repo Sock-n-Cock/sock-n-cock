@@ -86,22 +86,47 @@ async def _save_to_db_delayed(doc_id: str, delay: float = 0.5):
         pass
 
 # <--- ИЗМЕНЕНО: Функция стала асинхронной и теперь обращается к БД
-async def _get_document(doc_id: str) -> dict:
+# async def _get_document(doc_id: str) -> dict:
+#     if doc_id not in documents:
+#         # Пытаемся найти документ в MongoDB
+#         doc_from_db = await documents_collection.find_one({"_id": doc_id})
+#
+#         if doc_from_db:
+#             # Если нашли, загружаем в память
+#             documents[doc_id] = {
+#                 "content": doc_from_db.get("content", ""),
+#                 "version": doc_from_db.get("version", 0),
+#                 "history": doc_from_db.get("history", [])
+#             }
+#         else:
+#             # Если нет, создаем пустой
+#             documents[doc_id] = {"content": "", "version": 0, "history": []}
+#             documents[doc_id] = new_doc
+#             # <--- ИЗМЕНЕНО: Сохраняем в базу сразу при создании
+#             try:
+#                 await documents_collection.insert_one(new_doc)
+#             except Exception as e:
+#                 # Если кто-то другой успел создать его на миллисекунду раньше, просто игнорируем ошибку
+#                 pass
+#
+#     return documents[doc_id]
+
+async def _get_document(doc_id: str):
     if doc_id not in documents:
-        # Пытаемся найти документ в MongoDB
-        doc_from_db = await documents_collection.find_one({"_id": doc_id})
-
-        if doc_from_db:
-            # Если нашли, загружаем в память
-            documents[doc_id] = {
-                "content": doc_from_db.get("content", ""),
-                "version": doc_from_db.get("version", 0),
-                "history": doc_from_db.get("history", [])
-            }
+        # Пытаемся найти в MongoDB
+        doc = await documents_collection.find_one({"_id": doc_id})
+        if doc:
+            documents[doc_id] = doc
         else:
-            # Если нет, создаем пустой
-            documents[doc_id] = {"content": "", "version": 0, "history": []}
-
+            # Если документа нет, создаем его
+            new_doc = {"_id": doc_id, "content": "", "version": 0, "history": []}
+            documents[doc_id] = new_doc
+            # <--- ИЗМЕНЕНО: Сохраняем в базу сразу при создании
+            try:
+                await documents_collection.insert_one(new_doc)
+            except Exception as e:
+                # Если кто-то другой успел создать его на миллисекунду раньше, просто игнорируем ошибку
+                pass
     return documents[doc_id]
 
 
