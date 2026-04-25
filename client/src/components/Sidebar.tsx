@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Users, Wifi, WifiOff, Activity, ChevronDown, ChevronRight, Hash } from 'lucide-react';
+import { Users, Wifi, WifiOff, Activity, ChevronDown, ChevronRight, Hash, FileText } from 'lucide-react'; // <--- ДОБАВЛЕНА иконка FileText
 import type { User } from '../types';
 
 interface SidebarProps {
@@ -8,10 +8,11 @@ interface SidebarProps {
   currentUserId: string;
   logs: string[];
   docId: string;
+  availableDocs: string[]; // <--- ДОБАВЛЕНО: Массив доступных документов
   onJoinRoom: (newRoomId: string) => void;
 }
 
-export const Sidebar: React.FC<SidebarProps> = ({ isConnected, roomUsers, currentUserId, logs, docId, onJoinRoom }) => {
+export const Sidebar: React.FC<SidebarProps> = ({ isConnected, roomUsers, currentUserId, logs, docId, availableDocs, onJoinRoom }) => {
   const [roomInput, setRoomInput] = useState(docId);
   const [isLogsVisible, setIsLogsVisible] = useState(true);
 
@@ -44,10 +45,35 @@ export const Sidebar: React.FC<SidebarProps> = ({ isConnected, roomUsers, curren
         <form className="room-manager" onSubmit={handleRoomChange}>
           <div className="input-group">
             <Hash size={16} className="input-icon" />
-            <input type="text" className="room-input" value={roomInput} onChange={(e) => setRoomInput(e.target.value)} placeholder="Enter Room ID" />
+            <input type="text" className="room-input" value={roomInput} onChange={(e) => setRoomInput(e.target.value)} placeholder="Enter or Create Room ID" />
           </div>
           <button type="submit" className="btn-primary">Connect</button>
         </form>
+      </div>
+
+      {/* <--- ДОБАВЛЕНО: Секция со списком документов из MongoDB ---> */}
+      <div className="sidebar-section">
+         <div className="section-header">
+          <span className="flex-center gap-2">
+            <FileText size={16}/> Saved Documents
+          </span>
+        </div>
+        <div className="users-list" style={{ marginTop: '8px' }}>
+          {availableDocs.length === 0 ? (
+            <div style={{ fontSize: '12px', color: '#6b7280' }}>No documents yet</div>
+          ) : (
+            availableDocs.map(doc => (
+              <div
+                key={doc}
+                className={`user-item ${doc === docId ? 'is-me' : ''}`}
+                onClick={() => onJoinRoom(doc)}
+                style={{ cursor: 'pointer' }}
+              >
+                <span className="user-name">{doc}</span>
+              </div>
+            ))
+          )}
+        </div>
       </div>
 
       <div className="sidebar-section users-section">

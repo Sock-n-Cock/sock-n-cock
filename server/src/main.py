@@ -2,8 +2,17 @@ import socketio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient  # <--- ДОБАВЛЕНО: импорт motor
 from collab import AppliedOperation, apply_operation, rebase_operation, IncomingOperation
 from kafka import KafkaManager
+
+from fastapi import Query
+
+# <--- ДОБАВЛЕНО: Настройка подключения к MongoDB
+MONGO_URL = "mongodb://localhost:27017"
+mongo_client = AsyncIOMotorClient(MONGO_URL)
+db = mongo_client.collab_database  # Название базы данных
+documents_collection = db.documents  # Название коллекции
 
 kafka = KafkaManager()
 sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
@@ -14,6 +23,7 @@ async def lifespan(app: FastAPI):
     await kafka.start()
     yield
     await kafka.stop()
+    mongo_client.close()  # <--- ДОБАВЛЕНО: Закрываем соединение с БД при остановке сервера
 
 
 fastapi_app = FastAPI(lifespan=lifespan)
@@ -32,15 +42,37 @@ app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app)
 rooms: dict[str, dict] = {}
 documents: dict[str, dict] = {}
 
+@fastapi_app.get("/documents")
+async def list_documents():
+    """Возвращает список всех ID документов из базы данных"""
+    cursor = documents_collection.find({}, {"_id": 1})
+    docs = await cursor.to_list(length=100)
+    return [doc["_id"] for doc in docs]
 
-def _get_document(doc_id: str) -> dict:
+
+# <--- ИЗМЕНЕНО: Функция стала асинхронной и теперь обращается к БД
+async def _get_document(doc_id: str) -> dict:
     if doc_id not in documents:
-        documents[doc_id] = {"content": "", "version": 0, "history": []}
+        # Пытаемся найти документ в MongoDB
+        doc_from_db = await documents_collection.find_one({"_id": doc_id})
+
+        if doc_from_db:
+            # Если нашли, загружаем в память
+            documents[doc_id] = {
+                "content": doc_from_db.get("content", ""),
+                "version": doc_from_db.get("version", 0),
+                "history": doc_from_db.get("history", [])
+            }
+        else:
+            # Если нет, создаем пустой
+            documents[doc_id] = {"content": "", "version": 0, "history": []}
+
     return documents[doc_id]
 
 
+# <--- ИЗМЕНЕНО: Добавлен await перед _get_document
 async def _emit_document_state(doc_id: str, target_sid: str):
-    document = _get_document(doc_id)
+    document = await _get_document(doc_id)
     await sio.emit('document-state', {
         'docId': doc_id,
         'content': document['content'],
@@ -98,9 +130,8 @@ async def cursor_move(sid, data):
 
 
 async def broadcast_edit(doc_id: str, data: IncomingOperation):
-    # All edits flow through Kafka and then through this function. That gives the
-    # server one ordered place to update the snapshot and assign the next version.
-    document = _get_document(doc_id)
+    # <--- ИЗМЕНЕНО: Добавлен await перед _get_document
+    document = await _get_document(doc_id)
     try:
         base_version = int(data['baseVersion'])
         current_version = int(document['version'])
@@ -121,6 +152,18 @@ async def broadcast_edit(doc_id: str, data: IncomingOperation):
             'version': int(document['version']),
         }
         history.append(applied)
+
+        # <--- ДОБАВЛЕНО: Сохраняем актуальное состояние в MongoDB
+        # Используем upsert=True, чтобы документ создался, если его еще нет
+        await documents_collection.update_one(
+            {"_id": doc_id},
+            {"$set": {
+                "content": document['content'],
+                "version": document['version'],
+                "history": document['history']
+            }},
+            upsert=True
+        )
 
         await sio.emit('server-update', applied, room=doc_id)
     except ValueError as e:

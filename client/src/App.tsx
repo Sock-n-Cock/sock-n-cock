@@ -2,7 +2,7 @@ import { useRef, useState, useEffect, type RefObject } from 'react';
 import { io } from "socket.io-client";
 import Editor, { type OnMount } from '@monaco-editor/react';
 import type { editor } from 'monaco-editor';
-import { Terminal } from 'lucide-react';
+import { Terminal, Save, Cloud, CloudOff } from 'lucide-react'; // <--- ДОБАВЛЕНЫ иконки
 
 import './App.css';
 import { Sidebar } from './components/Sidebar';
@@ -33,8 +33,6 @@ function applySnapshotToEditor(
   const model = editorInstance?.getModel();
   if (!model) return false;
 
-  // `setValue` triggers Monaco change events, so mark the update as remote to
-  // avoid sending the server snapshot back as a new local edit.
   isApplyingRemote.current = true;
   try {
     model.setValue(content);
@@ -55,8 +53,6 @@ function applyRemoteOpToEditor(
   const start = model.getPositionAt(op.start);
   const end = model.getPositionAt(op.end);
 
-  // Remote operations also mutate the editor model, so guard against echoing
-  // them back to the server through `onChange`.
   isApplyingRemote.current = true;
   try {
     model.applyEdits([{
@@ -94,6 +90,28 @@ function App() {
   const [isHydrated, setIsHydrated] = useState(false);
   const [roomUsers, setRoomUsers] = useState<User[]>([]);
 
+  // <--- ДОБАВЛЕНО: Стейты для списка документов и статуса сохранения
+  const [availableDocs, setAvailableDocs] = useState<string[]>([]);
+  const [isSaving, setIsSaving] = useState(false);
+
+  // <--- ДОБАВЛЕНО: Функция для загрузки списка документов
+  const fetchDocuments = async () => {
+    try {
+      const res = await fetch('http://localhost:3001/documents');
+      if (res.ok) {
+        const docs = await res.json();
+        setAvailableDocs(docs);
+      }
+    } catch (e) {
+      console.error("Failed to fetch documents:", e);
+    }
+  };
+
+  // <--- ДОБАВЛЕНО: Загружаем документы при старте
+  useEffect(() => {
+    fetchDocuments();
+  }, []);
+
   const addLog = (msg: string) => setLogs(prev => getTrimmedLogs(msg, prev));
   useEffect(() => {
     docIdRef.current = docId;
@@ -104,6 +122,7 @@ function App() {
     queuedRemoteOpsRef.current = [];
     pendingLocalOpsRef.current = [];
     serverVersionRef.current = null;
+    setIsSaving(false);
   };
 
   const joinRoom = (newRoomId: string) => {
@@ -118,6 +137,9 @@ function App() {
 
     addLog(`Joining room: ${newRoomId}`);
     socket.emit('join', { docId: newRoomId, userName: USER_NAME, color: USER_COLOR });
+
+    // <--- ДОБАВЛЕНО: Обновляем список документов при смене комнаты (вдруг создали новую)
+    fetchDocuments();
   };
 
   const removeUserDecorations = (userId: string) => {
@@ -139,6 +161,7 @@ function App() {
     }
 
     nextOp.sent = true;
+    setIsSaving(true); // <--- ДОБАВЛЕНО: Включаем индикатор сохранения
     socket.emit('client-op', {
       docId: nextOp.docId,
       opId: nextOp.opId,
@@ -171,8 +194,6 @@ function App() {
     const currentVersion = serverVersionRef.current;
     if (!editorInstance || currentVersion === null) return;
 
-    // The snapshot establishes our baseline version. Any updates that arrived
-    // before hydration finishes are replayed only if they are newer than that.
     const pendingOps = queuedRemoteOpsRef.current
       .filter(op => op.version > currentVersion)
       .sort((left, right) => left.version - right.version);
@@ -194,12 +215,13 @@ function App() {
       }
     });
 
+    // <--- ДОБАВЛЕНО: Выключаем индикатор сохранения, если очередь локальных операций пуста
+    if (pendingLocalOpsRef.current.length === 0) setIsSaving(false);
     sendNextPendingOp();
   };
 
   const updateRemoteCursor = (data: RemoteCursorData) => {
     const { userId, selection, name, color } = data;
-
     if (!editorRef.current || !monacoRef.current || !selection) return;
 
     const safeId = generateSafeId(userId);
@@ -258,8 +280,6 @@ function App() {
     socket.on('disconnect', onDisconnect);
 
     socket.on('document-state', (snapshot: DocumentState) => {
-      // The snapshot can arrive before Monaco finishes mounting, so keep a copy
-      // and hydrate immediately if the editor instance already exists.
       pendingSnapshotRef.current = snapshot;
       serverVersionRef.current = snapshot.version;
 
@@ -296,6 +316,10 @@ function App() {
 
       if (op.userId === socket.id) {
         pendingLocalOpsRef.current = pendingLocalOpsRef.current.filter(localOp => localOp.opId !== op.opId);
+
+        // <--- ДОБАВЛЕНО: Выключаем индикатор сохранения, когда сервер подтвердил нашу операцию
+        if (pendingLocalOpsRef.current.length === 0) setIsSaving(false);
+
         sendNextPendingOp();
         return;
       }
@@ -319,23 +343,44 @@ function App() {
       socket.off('server-update');
       socket.off('remote-cursor');
     };
-  // Socket listeners are intentionally registered once and read the latest
-  // collaboration state through refs.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
     <div className="app-container">
-      <Sidebar isConnected={isConnected} roomUsers={roomUsers} currentUserId={socket.id || ''} logs={logs} docId={docId} onJoinRoom={joinRoom} />
+      {/* <--- ДОБАВЛЕНО: Передаем availableDocs в Sidebar ---> */}
+      <Sidebar
+        isConnected={isConnected}
+        roomUsers={roomUsers}
+        currentUserId={socket.id || ''}
+        logs={logs}
+        docId={docId}
+        availableDocs={availableDocs}
+        onJoinRoom={joinRoom}
+      />
       <div className="editor-container">
         <header className="editor-header">
           <div className="project-title">
             <Terminal size={18} className="accent-icon" />
             <span>Code Workspace</span>
           </div>
-          <div className="room-badge">
-            <span className="badge-dot" style={{ backgroundColor: isConnected ? '#10b981' : '#ef4444' }}></span>
-            {docId}
+
+          {/* <--- ДОБАВЛЕНО: Визуальный статус сохранения в верхней панели ---> */}
+          <div style={{ display: 'flex', gap: '16px', alignItems: 'center' }}>
+            <div className="save-status" style={{ fontSize: '12px', color: '#9ca3af', display: 'flex', alignItems: 'center', gap: '6px' }}>
+              {!isConnected ? (
+                <><CloudOff size={14} color="#ef4444" /> Offline</>
+              ) : isSaving ? (
+                <><Save size={14} color="#eab308" /> Saving to DB...</>
+              ) : (
+                <><Cloud size={14} color="#10b981" /> Saved to DB</>
+              )}
+            </div>
+
+            <div className="room-badge">
+              <span className="badge-dot" style={{ backgroundColor: isConnected ? '#10b981' : '#ef4444' }}></span>
+              {docId}
+            </div>
           </div>
         </header>
         <div className="editor-wrapper">
