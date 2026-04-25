@@ -2,7 +2,7 @@ import socketio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from collab import AppliedOperation, apply_operation, rebase_operation
+from collab import AppliedOperation, apply_operation, rebase_operation, IncomingOperation
 from kafka import KafkaManager
 
 kafka = KafkaManager()
@@ -97,7 +97,7 @@ async def cursor_move(sid, data):
     await sio.emit('remote-cursor', {**data, 'userId': sid}, room=doc_id, skip_sid=sid)
 
 
-async def broadcast_edit(doc_id: str, data: dict):
+async def broadcast_edit(doc_id: str, data: IncomingOperation):
     # All edits flow through Kafka and then through this function. That gives the
     # server one ordered place to update the snapshot and assign the next version.
     document = _get_document(doc_id)
