@@ -5,8 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient  # <--- ДОБАВЛЕНО: импорт motor
 from collab import AppliedOperation, apply_operation, rebase_operation, IncomingOperation
 from kafka import KafkaManager
+import asyncio
 
-from fastapi import Query
 
 # <--- ДОБАВЛЕНО: Настройка подключения к MongoDB
 MONGO_URL = "mongodb://localhost:27017"
@@ -41,6 +41,7 @@ app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app)
 # server-side snapshot and operation history used to rebase stale edits.
 rooms: dict[str, dict] = {}
 documents: dict[str, dict] = {}
+save_tasks: dict[str, asyncio.Task] = {} # <--- ДОБАВЛЕНО для debounce
 
 @fastapi_app.get("/documents")
 async def list_documents():
@@ -49,6 +50,40 @@ async def list_documents():
     docs = await cursor.to_list(length=100)
     return [doc["_id"] for doc in docs]
 
+
+# <--- ДОБАВЛЕНО: Эндпоинт удаления
+@fastapi_app.delete("/documents/{doc_id}")
+async def delete_document(doc_id: str):
+    # Отменяем ожидающее сохранение, если оно есть
+    if doc_id in save_tasks:
+        save_tasks[doc_id].cancel()
+        del save_tasks[doc_id]
+
+    await documents_collection.delete_one({"_id": doc_id})
+    if doc_id in documents:
+        del documents[doc_id]
+    return {"status": "deleted"}
+
+
+# <--- ДОБАВЛЕНО: Логика debounce (отложенного сохранения)
+async def _save_to_db_delayed(doc_id: str, delay: float = 0.5):
+    try:
+        await asyncio.sleep(delay)  # Ждем полсекунды
+        # Если за полсекунды никто не отменил задачу, сохраняем:
+        document = documents.get(doc_id)
+        if document:
+            await documents_collection.update_one(
+                {"_id": doc_id},
+                {"$set": {
+                    "content": document['content'],
+                    "version": document['version'],
+                    "history": document['history']
+                }},
+                upsert=True
+            )
+    except asyncio.CancelledError:
+        # Задача была отменена (пользователь напечатал новый символ до истечения 0.5 сек)
+        pass
 
 # <--- ИЗМЕНЕНО: Функция стала асинхронной и теперь обращается к БД
 async def _get_document(doc_id: str) -> dict:
@@ -130,7 +165,6 @@ async def cursor_move(sid, data):
 
 
 async def broadcast_edit(doc_id: str, data: IncomingOperation):
-    # <--- ИЗМЕНЕНО: Добавлен await перед _get_document
     document = await _get_document(doc_id)
     try:
         base_version = int(data['baseVersion'])
@@ -153,17 +187,12 @@ async def broadcast_edit(doc_id: str, data: IncomingOperation):
         }
         history.append(applied)
 
-        # <--- ДОБАВЛЕНО: Сохраняем актуальное состояние в MongoDB
-        # Используем upsert=True, чтобы документ создался, если его еще нет
-        await documents_collection.update_one(
-            {"_id": doc_id},
-            {"$set": {
-                "content": document['content'],
-                "version": document['version'],
-                "history": document['history']
-            }},
-            upsert=True
-        )
+        # <--- ИЗМЕНЕНО: Заменяем мгновенное сохранение на отложенное
+        if doc_id in save_tasks:
+            save_tasks[doc_id].cancel()  # Отменяем предыдущий таймер
+
+        # Запускаем новый таймер на 0.5 сек (функция _save_to_db_delayed должна быть определена выше)
+        save_tasks[doc_id] = asyncio.create_task(_save_to_db_delayed(doc_id))
 
         await sio.emit('server-update', applied, room=doc_id)
     except ValueError as e:

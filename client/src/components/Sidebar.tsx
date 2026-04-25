@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Users, Wifi, WifiOff, Activity, ChevronDown, ChevronRight, Hash, FileText } from 'lucide-react'; // <--- ДОБАВЛЕНА иконка FileText
+import { Users, Wifi, WifiOff, Activity, ChevronDown, ChevronRight, Hash, FileText, Trash2 } from 'lucide-react';
 import type { User } from '../types';
 
 interface SidebarProps {
@@ -8,11 +8,12 @@ interface SidebarProps {
   currentUserId: string;
   logs: string[];
   docId: string;
-  availableDocs: string[]; // <--- ДОБАВЛЕНО: Массив доступных документов
+  availableDocs: string[];
   onJoinRoom: (newRoomId: string) => void;
+  onDeleteDoc: (id: string) => void;
 }
 
-export const Sidebar: React.FC<SidebarProps> = ({ isConnected, roomUsers, currentUserId, logs, docId, availableDocs, onJoinRoom }) => {
+export const Sidebar: React.FC<SidebarProps> = ({ isConnected, roomUsers, currentUserId, logs, docId, availableDocs, onJoinRoom, onDeleteDoc }) => {
   const [roomInput, setRoomInput] = useState(docId);
   const [isLogsVisible, setIsLogsVisible] = useState(true);
 
@@ -51,14 +52,14 @@ export const Sidebar: React.FC<SidebarProps> = ({ isConnected, roomUsers, curren
         </form>
       </div>
 
-      {/* <--- ДОБАВЛЕНО: Секция со списком документов из MongoDB ---> */}
+      {/* Секция со списком документов из MongoDB */}
       <div className="sidebar-section">
          <div className="section-header">
           <span className="flex-center gap-2">
             <FileText size={16}/> Saved Documents
           </span>
         </div>
-        <div className="users-list" style={{ marginTop: '8px' }}>
+        <div className="users-list custom-scrollbar" style={{ marginTop: '8px', maxHeight: '180px', overflowY: 'auto', paddingRight: '4px' }}>
           {availableDocs.length === 0 ? (
             <div style={{ fontSize: '12px', color: '#6b7280' }}>No documents yet</div>
           ) : (
@@ -67,9 +68,21 @@ export const Sidebar: React.FC<SidebarProps> = ({ isConnected, roomUsers, curren
                 key={doc}
                 className={`user-item ${doc === docId ? 'is-me' : ''}`}
                 onClick={() => onJoinRoom(doc)}
-                style={{ cursor: 'pointer' }}
+                style={{ cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
               >
-                <span className="user-name">{doc}</span>
+                <span className="user-name" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{doc}</span>
+
+                {/* Кнопка удаления */}
+                <Trash2
+                  size={14}
+                  style={{ color: '#ef4444', minWidth: '14px', opacity: 0.7 }}
+                  onClick={(e) => {
+                    e.stopPropagation(); // Чтобы клик не вызывал onJoinRoom
+                    onDeleteDoc(doc);
+                  }}
+                  onMouseEnter={(e) => e.currentTarget.style.opacity = '1'}
+                  onMouseLeave={(e) => e.currentTarget.style.opacity = '0.7'}
+                />
               </div>
             ))
           )}

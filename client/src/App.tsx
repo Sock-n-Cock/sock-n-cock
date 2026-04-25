@@ -107,6 +107,25 @@ function App() {
     }
   };
 
+
+  // <--- ДОБАВЛЕНО: Функция удаления документа
+  const deleteDocument = async (idToDelete: string) => {
+    if (!confirm(`Are you sure you want to delete document "${idToDelete}"?`)) return;
+
+    try {
+      const res = await fetch(`http://localhost:3001/documents/${idToDelete}`, { method: 'DELETE' });
+      if (res.ok) {
+        setAvailableDocs(prev => prev.filter(d => d !== idToDelete));
+        // Если мы удалили документ, в котором сейчас находимся, перекидываем в main-room
+        if (idToDelete === docIdRef.current) {
+          joinRoom('main-room');
+        }
+      }
+    } catch (e) {
+      console.error("Failed to delete document:", e);
+    }
+  };
+
   // <--- ДОБАВЛЕНО: Загружаем документы при старте
   useEffect(() => {
     fetchDocuments();
@@ -305,6 +324,13 @@ function App() {
     });
 
     socket.on('server-update', (op: ServerOp) => {
+      setAvailableDocs(prev => {
+        if (!prev.includes(docIdRef.current)) {
+          return [...prev, docIdRef.current].sort();
+        }
+        return prev;
+      });
+      
       if (serverVersionRef.current === null || !editorRef.current) {
         queuedRemoteOpsRef.current.push(op);
         return;
@@ -357,6 +383,7 @@ function App() {
         docId={docId}
         availableDocs={availableDocs}
         onJoinRoom={joinRoom}
+        onDeleteDoc={deleteDocument}
       />
       <div className="editor-container">
         <header className="editor-header">
