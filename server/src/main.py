@@ -2,17 +2,16 @@ import socketio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient  # <--- ДОБАВЛЕНО: импорт motor
+from motor.motor_asyncio import AsyncIOMotorClient
 from collab import AppliedOperation, apply_operation, rebase_operation, IncomingOperation
 from kafka import KafkaManager
 import asyncio
 
 
-# <--- ДОБАВЛЕНО: Настройка подключения к MongoDB
 MONGO_URL = "mongodb://localhost:27017"
 mongo_client = AsyncIOMotorClient(MONGO_URL)
-db = mongo_client.collab_database  # Название базы данных
-documents_collection = db.documents  # Название коллекции
+db = mongo_client.collab_database
+documents_collection = db.documents
 
 kafka = KafkaManager()
 sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
@@ -23,7 +22,7 @@ async def lifespan(app: FastAPI):
     await kafka.start()
     yield
     await kafka.stop()
-    mongo_client.close()  # <--- ДОБАВЛЕНО: Закрываем соединение с БД при остановке сервера
+    mongo_client.close()
 
 
 fastapi_app = FastAPI(lifespan=lifespan)
@@ -37,11 +36,9 @@ fastapi_app.add_middleware(
 
 app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app)
 
-# `rooms` stores presence metadata, while `documents` is the authoritative
-# server-side snapshot and operation history used to rebase stale edits.
 rooms: dict[str, dict] = {}
 documents: dict[str, dict] = {}
-save_tasks: dict[str, asyncio.Task] = {} # <--- ДОБАВЛЕНО для debounce
+save_tasks: dict[str, asyncio.Task] = {}
 
 @fastapi_app.get("/documents")
 async def list_documents():
@@ -51,10 +48,8 @@ async def list_documents():
     return [doc["_id"] for doc in docs]
 
 
-# <--- ДОБАВЛЕНО: Эндпоинт удаления
 @fastapi_app.delete("/documents/{doc_id}")
 async def delete_document(doc_id: str):
-    # Отменяем ожидающее сохранение, если оно есть
     if doc_id in save_tasks:
         save_tasks[doc_id].cancel()
         del save_tasks[doc_id]
@@ -65,11 +60,9 @@ async def delete_document(doc_id: str):
     return {"status": "deleted"}
 
 
-# <--- ДОБАВЛЕНО: Логика debounce (отложенного сохранения)
 async def _save_to_db_delayed(doc_id: str, delay: float = 0.5):
     try:
         await asyncio.sleep(delay)  # Ждем полсекунды
-        # Если за полсекунды никто не отменил задачу, сохраняем:
         document = documents.get(doc_id)
         if document:
             await documents_collection.update_one(
@@ -82,55 +75,24 @@ async def _save_to_db_delayed(doc_id: str, delay: float = 0.5):
                 upsert=True
             )
     except asyncio.CancelledError:
-        # Задача была отменена (пользователь напечатал новый символ до истечения 0.5 сек)
         pass
 
-# <--- ИЗМЕНЕНО: Функция стала асинхронной и теперь обращается к БД
-# async def _get_document(doc_id: str) -> dict:
-#     if doc_id not in documents:
-#         # Пытаемся найти документ в MongoDB
-#         doc_from_db = await documents_collection.find_one({"_id": doc_id})
-#
-#         if doc_from_db:
-#             # Если нашли, загружаем в память
-#             documents[doc_id] = {
-#                 "content": doc_from_db.get("content", ""),
-#                 "version": doc_from_db.get("version", 0),
-#                 "history": doc_from_db.get("history", [])
-#             }
-#         else:
-#             # Если нет, создаем пустой
-#             documents[doc_id] = {"content": "", "version": 0, "history": []}
-#             documents[doc_id] = new_doc
-#             # <--- ИЗМЕНЕНО: Сохраняем в базу сразу при создании
-#             try:
-#                 await documents_collection.insert_one(new_doc)
-#             except Exception as e:
-#                 # Если кто-то другой успел создать его на миллисекунду раньше, просто игнорируем ошибку
-#                 pass
-#
-#     return documents[doc_id]
 
 async def _get_document(doc_id: str):
     if doc_id not in documents:
-        # Пытаемся найти в MongoDB
         doc = await documents_collection.find_one({"_id": doc_id})
         if doc:
             documents[doc_id] = doc
         else:
-            # Если документа нет, создаем его
             new_doc = {"_id": doc_id, "content": "", "version": 0, "history": []}
             documents[doc_id] = new_doc
-            # <--- ИЗМЕНЕНО: Сохраняем в базу сразу при создании
             try:
                 await documents_collection.insert_one(new_doc)
             except Exception as e:
-                # Если кто-то другой успел создать его на миллисекунду раньше, просто игнорируем ошибку
                 pass
     return documents[doc_id]
 
 
-# <--- ИЗМЕНЕНО: Добавлен await перед _get_document
 async def _emit_document_state(doc_id: str, target_sid: str):
     document = await _get_document(doc_id)
     await sio.emit('document-state', {
@@ -212,11 +174,9 @@ async def broadcast_edit(doc_id: str, data: IncomingOperation):
         }
         history.append(applied)
 
-        # <--- ИЗМЕНЕНО: Заменяем мгновенное сохранение на отложенное
         if doc_id in save_tasks:
-            save_tasks[doc_id].cancel()  # Отменяем предыдущий таймер
+            save_tasks[doc_id].cancel()
 
-        # Запускаем новый таймер на 0.5 сек (функция _save_to_db_delayed должна быть определена выше)
         save_tasks[doc_id] = asyncio.create_task(_save_to_db_delayed(doc_id))
 
         await sio.emit('server-update', applied, room=doc_id)

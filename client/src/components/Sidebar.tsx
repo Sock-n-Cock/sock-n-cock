@@ -52,7 +52,6 @@ export const Sidebar: React.FC<SidebarProps> = ({ isConnected, roomUsers, curren
         </form>
       </div>
 
-      {/* Секция со списком документов из MongoDB */}
       <div className="sidebar-section">
          <div className="section-header">
           <span className="flex-center gap-2">

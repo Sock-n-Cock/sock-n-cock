@@ -2,7 +2,7 @@ import { useRef, useState, useEffect, type RefObject } from 'react';
 import { io } from "socket.io-client";
 import Editor, { type OnMount } from '@monaco-editor/react';
 import type { editor } from 'monaco-editor';
-import { Terminal, Save, Cloud, CloudOff } from 'lucide-react'; // <--- ДОБАВЛЕНЫ иконки
+import { Terminal, Save, Cloud, CloudOff } from 'lucide-react';
 
 import './App.css';
 import { Sidebar } from './components/Sidebar';
@@ -90,11 +90,9 @@ function App() {
   const [isHydrated, setIsHydrated] = useState(false);
   const [roomUsers, setRoomUsers] = useState<User[]>([]);
 
-  // <--- ДОБАВЛЕНО: Стейты для списка документов и статуса сохранения
   const [availableDocs, setAvailableDocs] = useState<string[]>([]);
   const [isSaving, setIsSaving] = useState(false);
 
-  // <--- ДОБАВЛЕНО: Функция для загрузки списка документов
   const fetchDocuments = async () => {
     try {
       const res = await fetch('http://localhost:3001/documents');
@@ -108,7 +106,6 @@ function App() {
   };
 
 
-  // <--- ДОБАВЛЕНО: Функция удаления документа
   const deleteDocument = async (idToDelete: string) => {
     if (!confirm(`Are you sure you want to delete document "${idToDelete}"?`)) return;
 
@@ -116,7 +113,6 @@ function App() {
       const res = await fetch(`http://localhost:3001/documents/${idToDelete}`, { method: 'DELETE' });
       if (res.ok) {
         setAvailableDocs(prev => prev.filter(d => d !== idToDelete));
-        // Если мы удалили документ, в котором сейчас находимся, перекидываем в main-room
         if (idToDelete === docIdRef.current) {
           joinRoom('main-room');
         }
@@ -126,7 +122,6 @@ function App() {
     }
   };
 
-  // <--- ДОБАВЛЕНО: Загружаем документы при старте
   useEffect(() => {
     fetchDocuments();
   }, []);
@@ -157,7 +152,6 @@ function App() {
     addLog(`Joining room: ${newRoomId}`);
     socket.emit('join', { docId: newRoomId, userName: USER_NAME, color: USER_COLOR });
 
-    // <--- ДОБАВЛЕНО: Обновляем список документов при смене комнаты (вдруг создали новую)
     fetchDocuments();
   };
 
@@ -180,7 +174,7 @@ function App() {
     }
 
     nextOp.sent = true;
-    setIsSaving(true); // <--- ДОБАВЛЕНО: Включаем индикатор сохранения
+    setIsSaving(true);
     socket.emit('client-op', {
       docId: nextOp.docId,
       opId: nextOp.opId,
@@ -234,7 +228,6 @@ function App() {
       }
     });
 
-    // <--- ДОБАВЛЕНО: Выключаем индикатор сохранения, если очередь локальных операций пуста
     if (pendingLocalOpsRef.current.length === 0) setIsSaving(false);
     sendNextPendingOp();
   };
@@ -330,7 +323,7 @@ function App() {
         }
         return prev;
       });
-      
+
       if (serverVersionRef.current === null || !editorRef.current) {
         queuedRemoteOpsRef.current.push(op);
         return;
@@ -343,7 +336,6 @@ function App() {
       if (op.userId === socket.id) {
         pendingLocalOpsRef.current = pendingLocalOpsRef.current.filter(localOp => localOp.opId !== op.opId);
 
-        // <--- ДОБАВЛЕНО: Выключаем индикатор сохранения, когда сервер подтвердил нашу операцию
         if (pendingLocalOpsRef.current.length === 0) setIsSaving(false);
 
         sendNextPendingOp();
@@ -374,7 +366,6 @@ function App() {
 
   return (
     <div className="app-container">
-      {/* <--- ДОБАВЛЕНО: Передаем availableDocs в Sidebar ---> */}
       <Sidebar
         isConnected={isConnected}
         roomUsers={roomUsers}
@@ -392,7 +383,6 @@ function App() {
             <span>Code Workspace</span>
           </div>
 
-          {/* <--- ДОБАВЛЕНО: Визуальный статус сохранения в верхней панели ---> */}
           <div style={{ display: 'flex', gap: '16px', alignItems: 'center' }}>
             <div className="save-status" style={{ fontSize: '12px', color: '#9ca3af', display: 'flex', alignItems: 'center', gap: '6px' }}>
               {!isConnected ? (
