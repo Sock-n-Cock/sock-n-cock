@@ -76,6 +76,7 @@ async def _save_to_db_delayed(doc_id: str, delay: float = 0.5):
                 upsert=True
             )
     except asyncio.CancelledError:
+        # Ожидаемо при debounce/отмене отложенного сохранения: ничего сохранять не нужно.
         pass
 
 
