@@ -7,7 +7,7 @@ import { Terminal } from 'lucide-react';
 import './App.css';
 import { Sidebar } from './components/Sidebar';
 import { rebasePendingOperations } from './collab';
-import { generateSafeId, getTrimmedLogs, generateUserCredentials } from './utils';
+import { generateSafeId, getTrimmedLogs, generateUserCredentials, generateOperationId } from './utils';
 import type { User, RemoteCursorData, ServerOp, DocumentState, PendingClientOp } from './types';
 
 const socket = io('ws://localhost:3001', {
@@ -24,8 +24,6 @@ type MonacoEditorInstance = Parameters<OnMount>[0];
 type MonacoInstance = Parameters<OnMount>[1];
 
 const { name: USER_NAME, color: USER_COLOR } = generateUserCredentials();
-
-const createOpId = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 function applySnapshotToEditor(
   editorInstance: MonacoEditorInstance | null,
@@ -158,7 +156,7 @@ function App() {
       .sort((left, right) => right.rangeOffset - left.rangeOffset)
       .map<PendingClientOp>(change => ({
         docId: docIdRef.current,
-        opId: createOpId(),
+        opId: generateOperationId(),
         start: change.rangeOffset,
         end: change.rangeOffset + change.rangeLength,
         text: change.text,

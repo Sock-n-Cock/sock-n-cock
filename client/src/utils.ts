@@ -11,3 +11,7 @@ export const generateUserCredentials = () => ({
   name: `User_${Math.floor(Math.random() * 1000)}`,
   color: `#${Math.floor(Math.random() * 16777215).toString(16).padStart(6, '0')}`
 });
+
+export const generateOperationId = () => (
+  `${Date.now()}-${Math.random().toString(16).slice(2)}`
+);
