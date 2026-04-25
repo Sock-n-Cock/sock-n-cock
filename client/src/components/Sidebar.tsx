@@ -26,7 +26,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ isConnected, roomUsers, curren
     <div className="sidebar">
       <div className="sidebar-brand">
         <img
-          src="../../public/sock-n-cock-logo.png"
+          src="/sock-n-cock-logo.png"
           alt=""
           style={{
             width: '24px',

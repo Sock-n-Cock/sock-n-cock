@@ -1,5 +1,3 @@
-import type { IRange } from "monaco-editor";
-
 export type User = {
   id: string;
   name: string;
@@ -20,11 +18,24 @@ export type RemoteCursorData = {
   };
 };
 
-export type ServerOp = {
+export type ClientOp = {
   docId: string;
-  userId: string;
+  opId: string;
+  start: number;
+  end: number;
   text: string;
-  range: IRange;
+};
+
+export type PendingClientOp = ClientOp & {
+  sent: boolean;
+};
+
+export type OutgoingClientOp = ClientOp & {
+  baseVersion: number;
+};
+
+export type ServerOp = OutgoingClientOp & {
+  userId: string;
   version: number;
 };
 
