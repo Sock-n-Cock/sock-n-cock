@@ -28,8 +28,8 @@ Collaborative real-time text editor with Socket.IO, FastAPI, Monaco, and Kafka.
 
 ## Launch
 
-1. Start Kafka from the project root:
-
+1. Start Kafka and Redis (Docker) from the project root:
+ц
 ```bash
 docker compose up -d
 ```

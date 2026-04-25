@@ -21,5 +21,23 @@ services:
     volumes:
       - mongo_data:/data/db
 
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    networks:
+      - app-network
+    volumes:
+      - redis-data:/data
+
+networks:
+  app-network:
+    driver: bridge
+
 volumes:
+  redis-data:
   mongo_data:
+
+
+
