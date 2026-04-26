@@ -22,7 +22,6 @@ async def lifespan(app: FastAPI):
     await kafka.stop()
     await mongo_manager.close()
 
-
 fastapi_app = FastAPI(lifespan=lifespan)
 fastapi_app.add_middleware(
     CORSMiddleware,
@@ -37,7 +36,6 @@ app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app)
 rooms: dict[str, dict] = {}
 documents: dict[str, dict] = {}
 save_tasks: dict[str, asyncio.Task] = {}
-
 
 @fastapi_app.get("/documents")
 async def list_documents():
@@ -72,8 +70,7 @@ async def _save_to_db_delayed(doc_id: str, delay: float = 0.5):
                 history=history_to_save
             )
     except asyncio.CancelledError:
-        pass
-
+        return
 
 async def _get_document(doc_id: str):
     if doc_id not in documents:
@@ -86,7 +83,6 @@ async def _get_document(doc_id: str):
             await mongo_manager.create_document(new_doc)
 
     return documents[doc_id]
-
 
 async def _emit_document_state(doc_id: str, target_sid: str):
     document = await _get_document(doc_id)
