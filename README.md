@@ -1,21 +1,25 @@
+### <div align="center"><img src="./client/public/sock-n-cock-logo.png" width="200"> 
 # sock-n-cock
 
 Collaborative real-time text editor with Socket.IO, FastAPI, Monaco, and Kafka.
 
 ## What It Does
 
-- Multiple browser tabs can edit the same Monaco document in real time.
-- The browser talks to the backend over Socket.IO using the WebSocket transport.
+- Multiple clients can edit the same document in real time.
+- The client talks to the backend over Socket.IO using the WebSocket transport.
 - Edit operations are published to Kafka and then replayed back through the server.
 - The server keeps an in-memory snapshot of each document so late joiners receive
   the current content immediately instead of starting from an empty editor.
 
 ## Requirements
 
+Server:
 - Docker
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) — package manager and runner
-- Node.js 18+ and npm
+
+Client:
+- Node.js 20+ and npm
 
 ## Project Layout
 
@@ -64,10 +68,10 @@ npm run dev
 
 Open [http://localhost:5173](http://localhost:5173) in multiple tabs to collaborate.
 
-## How To Use It
+## How To Use It 
 
-- Type in one tab and the edits should appear in the others.
-- Open a fresh tab after making edits; it should receive the current document
+- Type in one client and the edits should appear in the others.
+- Open a fresh client instance after making edits; it should receive the current document
   snapshot on join.
 - The left sidebar shows connected users and simple activity logs.
 
@@ -75,6 +79,10 @@ Open [http://localhost:5173](http://localhost:5173) in multiple tabs to collabor
 
 - Stop the frontend and backend with `Ctrl+C` in their terminals.
 - Stop Kafka with `docker compose down`.
+
+## Documentation
+
+- [Architecture](./docs/ARCHITECTURE.md) with System overview, Data flow and Tech Stack
 
 ## Notes
 
