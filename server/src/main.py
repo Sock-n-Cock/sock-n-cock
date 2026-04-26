@@ -33,7 +33,6 @@ fastapi_app.add_middleware(
 
 app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app)
 
-rooms: dict[str, dict] = {}
 documents: dict[str, dict] = {}
 save_tasks: dict[str, asyncio.Task] = {}
 
