@@ -1,31 +1,26 @@
 import socketio
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 from collab import AppliedOperation, apply_operation, rebase_operation, IncomingOperation
 from kafka import KafkaManager
 from redis_manager import RedisManager
-import asyncio
-from pymongo.errors import DuplicateKeyError
+from mongo_manager import MongoManager
 
 
-MONGO_URL = "mongodb://localhost:27017"
-mongo_client = AsyncIOMotorClient(MONGO_URL)
-db = mongo_client.collab_database
-documents_collection = db.documents
-
+mongo_manager = MongoManager()
 redis_manager = RedisManager()
 kafka = KafkaManager()
 sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    await mongo_manager.connect()
     await kafka.start()
     yield
     await kafka.stop()
-    mongo_client.close()
+    await mongo_manager.close()
 
 
 fastapi_app = FastAPI(lifespan=lifespan)
@@ -43,12 +38,11 @@ rooms: dict[str, dict] = {}
 documents: dict[str, dict] = {}
 save_tasks: dict[str, asyncio.Task] = {}
 
+
 @fastapi_app.get("/documents")
 async def list_documents():
     """Возвращает список всех ID документов из базы данных"""
-    cursor = documents_collection.find({}, {"_id": 1})
-    docs = await cursor.to_list(length=100)
-    return [doc["_id"] for doc in docs]
+    return await mongo_manager.get_all_document_ids()
 
 
 @fastapi_app.delete("/documents/{doc_id}")
@@ -57,7 +51,8 @@ async def delete_document(doc_id: str):
         save_tasks[doc_id].cancel()
         del save_tasks[doc_id]
 
-    await documents_collection.delete_one({"_id": doc_id})
+    await mongo_manager.delete_document(doc_id)
+
     if doc_id in documents:
         del documents[doc_id]
     return {"status": "deleted"}
@@ -65,39 +60,31 @@ async def delete_document(doc_id: str):
 
 async def _save_to_db_delayed(doc_id: str, delay: float = 0.5):
     try:
-        await asyncio.sleep(delay)  # Ждем полсекунды
+        await asyncio.sleep(delay)
         document = documents.get(doc_id)
         if document:
-            await documents_collection.update_one(
-                {"_id": doc_id},
-                {"$set": {
-                    "content": document['content'],
-                    "version": document['version'],
-                    "history": document['history']
-                }},
-                upsert=True
+            history_to_save = document['history'][-200:] if document.get('history') else []
+
+            await mongo_manager.update_document_state(
+                doc_id=doc_id,
+                content=document['content'],
+                version=document['version'],
+                history=history_to_save
             )
     except asyncio.CancelledError:
-        # Ожидаемо при debounce/отмене отложенного сохранения: ничего сохранять не нужно.
         pass
 
 
 async def _get_document(doc_id: str):
     if doc_id not in documents:
-        doc = await documents_collection.find_one({"_id": doc_id})
+        doc = await mongo_manager.get_document(doc_id)
         if doc:
             documents[doc_id] = doc
         else:
             new_doc = {"_id": doc_id, "content": "", "version": 0, "history": []}
             documents[doc_id] = new_doc
-            try:
-                await documents_collection.insert_one(new_doc)
-            except DuplicateKeyError:
-                # Документ уже был создан параллельно другим запросом/воркером.
-                pass
-            except Exception as e:
-                print(f"Failed to insert document {doc_id}: {e}")
-                raise
+            await mongo_manager.create_document(new_doc)
+
     return documents[doc_id]
 
 
@@ -156,7 +143,6 @@ async def join(sid, data):
         users = await redis_manager.get_users(doc_id)
 
         await sio.emit('users-changed', users, room=doc_id)
-
         await _emit_document_state(doc_id, sid)
 
         print(f"User {sid} ({data['userName']}) joined doc {doc_id}")
