@@ -14,6 +14,13 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
 
+  mongodb:
+    image: mongo:latest
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
   redis:
     image: redis:alpine
     ports:
@@ -30,3 +37,7 @@ networks:
 
 volumes:
   redis-data:
+  mongo_data:
+
+
+

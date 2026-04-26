@@ -2,7 +2,7 @@ import { useRef, useState, useEffect, type RefObject } from 'react';
 import { io } from "socket.io-client";
 import Editor, { type OnMount } from '@monaco-editor/react';
 import type { editor } from 'monaco-editor';
-import { Terminal } from 'lucide-react';
+import { Terminal, Save, Cloud, CloudOff } from 'lucide-react';
 
 import './App.css';
 import { Sidebar } from './components/Sidebar';
@@ -33,8 +33,6 @@ function applySnapshotToEditor(
   const model = editorInstance?.getModel();
   if (!model) return false;
 
-  // `setValue` triggers Monaco change events, so mark the update as remote to
-  // avoid sending the server snapshot back as a new local edit.
   isApplyingRemote.current = true;
   try {
     model.setValue(content);
@@ -55,8 +53,6 @@ function applyRemoteOpToEditor(
   const start = model.getPositionAt(op.start);
   const end = model.getPositionAt(op.end);
 
-  // Remote operations also mutate the editor model, so guard against echoing
-  // them back to the server through `onChange`.
   isApplyingRemote.current = true;
   try {
     model.applyEdits([{
@@ -94,6 +90,43 @@ function App() {
   const [isHydrated, setIsHydrated] = useState(false);
   const [roomUsers, setRoomUsers] = useState<User[]>([]);
 
+  const [availableDocs, setAvailableDocs] = useState<string[]>([]);
+  // Changed isSaving to a more descriptive saveStatus
+  const [saveStatus, setSaveStatus] = useState<'synced' | 'saving' | 'db-saved'>('synced');
+
+  const fetchDocuments = async () => {
+    try {
+      const res = await fetch('http://localhost:3001/documents');
+      if (res.ok) {
+        const docs = await res.json();
+        setAvailableDocs(docs);
+      }
+    } catch (e) {
+      console.error("Failed to fetch documents:", e);
+    }
+  };
+
+
+  const deleteDocument = async (idToDelete: string) => {
+    if (!confirm(`Are you sure you want to delete document "${idToDelete}"?`)) return;
+
+    try {
+      const res = await fetch(`http://localhost:3001/documents/${idToDelete}`, { method: 'DELETE' });
+      if (res.ok) {
+        setAvailableDocs(prev => prev.filter(d => d !== idToDelete));
+        if (idToDelete === docIdRef.current) {
+          joinRoom('main-room');
+        }
+      }
+    } catch (e) {
+      console.error("Failed to delete document:", e);
+    }
+  };
+
+  useEffect(() => {
+    fetchDocuments();
+  }, []);
+
   const addLog = (msg: string) => setLogs(prev => getTrimmedLogs(msg, prev));
   useEffect(() => {
     docIdRef.current = docId;
@@ -104,6 +137,7 @@ function App() {
     queuedRemoteOpsRef.current = [];
     pendingLocalOpsRef.current = [];
     serverVersionRef.current = null;
+    setSaveStatus('synced');
   };
 
   const joinRoom = (newRoomId: string) => {
@@ -118,6 +152,8 @@ function App() {
 
     addLog(`Joining room: ${newRoomId}`);
     socket.emit('join', { docId: newRoomId, userName: USER_NAME, color: USER_COLOR });
+
+    fetchDocuments();
   };
 
   const removeUserDecorations = (userId: string) => {
@@ -152,6 +188,8 @@ function App() {
   const handleEditorChange = (_value: string | undefined, event?: editor.IModelContentChangedEvent) => {
     if (isApplyingRemote.current || !socket.connected || !isHydrated || !event) return;
 
+    setSaveStatus('saving'); // Start saving process visually
+
     const pendingOps = [...event.changes]
       .sort((left, right) => right.rangeOffset - left.rangeOffset)
       .map<PendingClientOp>(change => ({
@@ -171,8 +209,6 @@ function App() {
     const currentVersion = serverVersionRef.current;
     if (!editorInstance || currentVersion === null) return;
 
-    // The snapshot establishes our baseline version. Any updates that arrived
-    // before hydration finishes are replayed only if they are newer than that.
     const pendingOps = queuedRemoteOpsRef.current
       .filter(op => op.version > currentVersion)
       .sort((left, right) => left.version - right.version);
@@ -199,7 +235,6 @@ function App() {
 
   const updateRemoteCursor = (data: RemoteCursorData) => {
     const { userId, selection, name, color } = data;
-
     if (!editorRef.current || !monacoRef.current || !selection) return;
 
     const safeId = generateSafeId(userId);
@@ -258,8 +293,6 @@ function App() {
     socket.on('disconnect', onDisconnect);
 
     socket.on('document-state', (snapshot: DocumentState) => {
-      // The snapshot can arrive before Monaco finishes mounting, so keep a copy
-      // and hydrate immediately if the editor instance already exists.
       pendingSnapshotRef.current = snapshot;
       serverVersionRef.current = snapshot.version;
 
@@ -285,6 +318,13 @@ function App() {
     });
 
     socket.on('server-update', (op: ServerOp) => {
+      setAvailableDocs(prev => {
+        if (!prev.includes(docIdRef.current)) {
+          return [...prev, docIdRef.current].sort();
+        }
+        return prev;
+      });
+
       if (serverVersionRef.current === null || !editorRef.current) {
         queuedRemoteOpsRef.current.push(op);
         return;
@@ -310,6 +350,11 @@ function App() {
 
     socket.on('remote-cursor', updateRemoteCursor);
 
+    socket.on('document-saved', () => {
+      setSaveStatus('db-saved');
+      setTimeout(() => setSaveStatus('synced'), 2000);
+    });
+
     return () => {
       socket.off('connect');
       socket.off('disconnect');
@@ -318,24 +363,45 @@ function App() {
       socket.off('user-left');
       socket.off('server-update');
       socket.off('remote-cursor');
+      socket.off('document-saved');
     };
-  // Socket listeners are intentionally registered once and read the latest
-  // collaboration state through refs.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
     <div className="app-container">
-      <Sidebar isConnected={isConnected} roomUsers={roomUsers} currentUserId={socket.id || ''} logs={logs} docId={docId} onJoinRoom={joinRoom} />
+      <Sidebar
+        isConnected={isConnected}
+        roomUsers={roomUsers}
+        currentUserId={socket.id || ''}
+        logs={logs}
+        docId={docId}
+        availableDocs={availableDocs}
+        onJoinRoom={joinRoom}
+        onDeleteDoc={deleteDocument}
+      />
       <div className="editor-container">
         <header className="editor-header">
           <div className="project-title">
             <Terminal size={18} className="accent-icon" />
             <span>Code Workspace</span>
           </div>
-          <div className="room-badge">
-            <span className="badge-dot" style={{ backgroundColor: isConnected ? '#10b981' : '#ef4444' }}></span>
-            {docId}
+
+          <div style={{ display: 'flex', gap: '16px', alignItems: 'center' }}>
+            <div className="save-status" style={{ fontSize: '12px', color: '#9ca3af', display: 'flex', alignItems: 'center', gap: '6px' }}>
+              {!isConnected ? (
+                <><CloudOff size={14} color="#ef4444" /> Offline</>
+              ) : saveStatus === 'saving' ? (
+                <><Save size={14} color="#eab308" /> Saving...</>
+              ) : saveStatus === 'db-saved' ? (
+                <><Cloud size={14} color="#10b981" /> Saved to DB</>
+              ) : null}
+            </div>
+
+            <div className="room-badge">
+              <span className="badge-dot" style={{ backgroundColor: isConnected ? '#10b981' : '#ef4444' }}></span>
+              {docId}
+            </div>
           </div>
         </header>
         <div className="editor-wrapper">

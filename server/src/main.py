@@ -1,22 +1,26 @@
 import socketio
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from collab import AppliedOperation, apply_operation, rebase_operation, IncomingOperation
 from kafka import KafkaManager
 from redis_manager import RedisManager
+from mongo_manager import MongoManager
 
+
+mongo_manager = MongoManager()
 redis_manager = RedisManager()
 kafka = KafkaManager()
 sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    await mongo_manager.connect()
     await kafka.start()
     yield
     await kafka.stop()
-
+    await mongo_manager.close()
 
 fastapi_app = FastAPI(lifespan=lifespan)
 fastapi_app.add_middleware(
@@ -30,16 +34,83 @@ fastapi_app.add_middleware(
 app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app)
 
 documents: dict[str, dict] = {}
+save_tasks: dict[str, asyncio.Task] = {}
+
+@fastapi_app.get("/documents")
+async def list_documents():
+    """Возвращает список всех ID документов из базы данных"""
+    return await mongo_manager.get_all_document_ids()
 
 
-def _get_document(doc_id: str) -> dict:
+@fastapi_app.delete("/documents/{doc_id}")
+async def delete_document(doc_id: str):
+    if doc_id in save_tasks:
+        save_tasks[doc_id].cancel()
+        del save_tasks[doc_id]
+
+    await mongo_manager.delete_document(doc_id)
+
+    if doc_id in documents:
+        del documents[doc_id]
+    return {"status": "deleted"}
+
+
+# async def _save_to_db_delayed(doc_id: str, delay: float = 1000):
+#     try:
+#         await asyncio.sleep(delay)
+#         document = documents.get(doc_id)
+#         if document:
+#             history_to_save = document['history'][-200:] if document.get('history') else []
+#
+#             await mongo_manager.update_document_state(
+#                 doc_id=doc_id,
+#                 content=document['content'],
+#                 version=document['version'],
+#                 history=history_to_save
+#             )
+#     except asyncio.CancelledError:
+#         return
+#     except Exception as e:
+#         print(f"Error saving to MongoDB: {e}")
+
+
+async def _save_to_db_delayed(doc_id: str, delay: float = 1.0):
+    try:
+        await asyncio.sleep(delay)
+        document = documents.get(doc_id)
+        if document:
+            history_to_save = document['history'][-200:] if document.get('history') else []
+
+            await mongo_manager.update_document_state(
+                doc_id=doc_id,
+                content=document['content'],
+                version=document['version'],
+                history=history_to_save
+            )
+
+            await sio.emit('document-saved', {'docId': doc_id}, room=doc_id)
+            print(f"DEBUG: Document {doc_id} actually written to MongoDB")
+
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        print(f"Error saving to MongoDB: {e}")
+
+
+async def _get_document(doc_id: str):
     if doc_id not in documents:
-        documents[doc_id] = {"content": "", "version": 0, "history": []}
+        doc = await mongo_manager.get_document(doc_id)
+        if doc:
+            documents[doc_id] = doc
+        else:
+            new_doc = {"_id": doc_id, "content": "", "version": 0, "history": []}
+            documents[doc_id] = new_doc
+            await mongo_manager.create_document(new_doc)
+
     return documents[doc_id]
 
-
 async def _emit_document_state(doc_id: str, target_sid: str):
-    document = _get_document(doc_id)
+    document = await _get_document(doc_id)
     await sio.emit('document-state', {
         'docId': doc_id,
         'content': document['content'],
@@ -93,7 +164,6 @@ async def join(sid, data):
         users = await redis_manager.get_users(doc_id)
 
         await sio.emit('users-changed', users, room=doc_id)
-
         await _emit_document_state(doc_id, sid)
 
         print(f"User {sid} ({data['userName']}) joined doc {doc_id}")
@@ -144,7 +214,7 @@ async def cursor_move(sid, data):
 
 async def broadcast_edit(doc_id: str, data: IncomingOperation):
     try:
-        document = _get_document(doc_id)
+        document = await _get_document(doc_id)
         base_version = int(data['baseVersion'])
         current_version = int(document['version'])
 
@@ -163,7 +233,17 @@ async def broadcast_edit(doc_id: str, data: IncomingOperation):
             **rebased,
             'version': int(document['version']),
         }
+
         history.append(applied)
+
+        MAX_HISTORY = 200
+        if len(history) > MAX_HISTORY:
+            document['history'] = history[-MAX_HISTORY:]
+
+        if doc_id in save_tasks:
+            save_tasks[doc_id].cancel()
+
+        save_tasks[doc_id] = asyncio.create_task(_save_to_db_delayed(doc_id, delay=1.0))
 
         await sio.emit('server-update', applied, room=doc_id)
 
@@ -173,4 +253,8 @@ async def broadcast_edit(doc_id: str, data: IncomingOperation):
         if user_id:
             await _emit_document_state(doc_id, user_id)
     except Exception as e:
-        print(f"Error in broadcast_edit: {e}")
+        print(f"Error in broadcast_edit for doc {doc_id}: {e}")
+
+
+
+
