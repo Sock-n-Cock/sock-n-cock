@@ -91,7 +91,8 @@ function App() {
   const [roomUsers, setRoomUsers] = useState<User[]>([]);
 
   const [availableDocs, setAvailableDocs] = useState<string[]>([]);
-  const [isSaving, setIsSaving] = useState(false);
+  // Changed isSaving to a more descriptive saveStatus
+  const [saveStatus, setSaveStatus] = useState<'synced' | 'saving' | 'db-saved'>('synced');
 
   const fetchDocuments = async () => {
     try {
@@ -136,7 +137,7 @@ function App() {
     queuedRemoteOpsRef.current = [];
     pendingLocalOpsRef.current = [];
     serverVersionRef.current = null;
-    setIsSaving(false);
+    setSaveStatus('synced');
   };
 
   const joinRoom = (newRoomId: string) => {
@@ -174,7 +175,6 @@ function App() {
     }
 
     nextOp.sent = true;
-    setIsSaving(true);
     socket.emit('client-op', {
       docId: nextOp.docId,
       opId: nextOp.opId,
@@ -187,6 +187,8 @@ function App() {
 
   const handleEditorChange = (_value: string | undefined, event?: editor.IModelContentChangedEvent) => {
     if (isApplyingRemote.current || !socket.connected || !isHydrated || !event) return;
+
+    setSaveStatus('saving'); // Start saving process visually
 
     const pendingOps = [...event.changes]
       .sort((left, right) => right.rangeOffset - left.rangeOffset)
@@ -228,7 +230,6 @@ function App() {
       }
     });
 
-    if (pendingLocalOpsRef.current.length === 0) setIsSaving(false);
     sendNextPendingOp();
   };
 
@@ -335,9 +336,6 @@ function App() {
 
       if (op.userId === socket.id) {
         pendingLocalOpsRef.current = pendingLocalOpsRef.current.filter(localOp => localOp.opId !== op.opId);
-
-        if (pendingLocalOpsRef.current.length === 0) setIsSaving(false);
-
         sendNextPendingOp();
         return;
       }
@@ -352,6 +350,11 @@ function App() {
 
     socket.on('remote-cursor', updateRemoteCursor);
 
+    socket.on('document-saved', () => {
+      setSaveStatus('db-saved');
+      setTimeout(() => setSaveStatus('synced'), 2000);
+    });
+
     return () => {
       socket.off('connect');
       socket.off('disconnect');
@@ -360,6 +363,7 @@ function App() {
       socket.off('user-left');
       socket.off('server-update');
       socket.off('remote-cursor');
+      socket.off('document-saved');
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -387,11 +391,11 @@ function App() {
             <div className="save-status" style={{ fontSize: '12px', color: '#9ca3af', display: 'flex', alignItems: 'center', gap: '6px' }}>
               {!isConnected ? (
                 <><CloudOff size={14} color="#ef4444" /> Offline</>
-              ) : isSaving ? (
-                <><Save size={14} color="#eab308" /> Saving to DB...</>
-              ) : (
+              ) : saveStatus === 'saving' ? (
+                <><Save size={14} color="#eab308" /> Saving...</>
+              ) : saveStatus === 'db-saved' ? (
                 <><Cloud size={14} color="#10b981" /> Saved to DB</>
-              )}
+              ) : null}
             </div>
 
             <div className="room-badge">

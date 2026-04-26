@@ -55,7 +55,26 @@ async def delete_document(doc_id: str):
     return {"status": "deleted"}
 
 
-async def _save_to_db_delayed(doc_id: str, delay: float = 0.5):
+# async def _save_to_db_delayed(doc_id: str, delay: float = 1000):
+#     try:
+#         await asyncio.sleep(delay)
+#         document = documents.get(doc_id)
+#         if document:
+#             history_to_save = document['history'][-200:] if document.get('history') else []
+#
+#             await mongo_manager.update_document_state(
+#                 doc_id=doc_id,
+#                 content=document['content'],
+#                 version=document['version'],
+#                 history=history_to_save
+#             )
+#     except asyncio.CancelledError:
+#         return
+#     except Exception as e:
+#         print(f"Error saving to MongoDB: {e}")
+
+
+async def _save_to_db_delayed(doc_id: str, delay: float = 1.0):
     try:
         await asyncio.sleep(delay)
         document = documents.get(doc_id)
@@ -68,8 +87,15 @@ async def _save_to_db_delayed(doc_id: str, delay: float = 0.5):
                 version=document['version'],
                 history=history_to_save
             )
+
+            await sio.emit('document-saved', {'docId': doc_id}, room=doc_id)
+            print(f"DEBUG: Document {doc_id} actually written to MongoDB")
+
     except asyncio.CancelledError:
         return
+    except Exception as e:
+        print(f"Error saving to MongoDB: {e}")
+
 
 async def _get_document(doc_id: str):
     if doc_id not in documents:
@@ -207,18 +233,28 @@ async def broadcast_edit(doc_id: str, data: IncomingOperation):
             **rebased,
             'version': int(document['version']),
         }
+
         history.append(applied)
+
+        MAX_HISTORY = 200
+        if len(history) > MAX_HISTORY:
+            document['history'] = history[-MAX_HISTORY:]
 
         if doc_id in save_tasks:
             save_tasks[doc_id].cancel()
 
-        save_tasks[doc_id] = asyncio.create_task(_save_to_db_delayed(doc_id))
+        save_tasks[doc_id] = asyncio.create_task(_save_to_db_delayed(doc_id, delay=1.0))
 
         await sio.emit('server-update', applied, room=doc_id)
+
     except ValueError as e:
         print(f"Discarding invalid edit for {doc_id}: {e}")
         user_id = data.get('userId')
         if user_id:
             await _emit_document_state(doc_id, user_id)
     except Exception as e:
-        print(f"Error in broadcast_edit: {e}")
+        print(f"Error in broadcast_edit for doc {doc_id}: {e}")
+
+
+
+
