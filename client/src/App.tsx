@@ -91,7 +91,6 @@ function App() {
   const [roomUsers, setRoomUsers] = useState<User[]>([]);
 
   const [availableDocs, setAvailableDocs] = useState<string[]>([]);
-  // Changed isSaving to a more descriptive saveStatus
   const [saveStatus, setSaveStatus] = useState<'synced' | 'saving' | 'db-saved'>('synced');
 
   const fetchDocuments = async () => {

@@ -22,3 +22,13 @@ class RedisManager:
     async def get_users(self, doc_id: str):
         users = await self.redis.hgetall(f"doc:{doc_id}:users")
         return [json.loads(u) for u in users.values()]
+
+    async def get_document_state(self, doc_id: str) -> dict | None:
+        data = await self.redis.get(f"doc:{doc_id}:state")
+        return json.loads(data) if data else None
+
+    async def set_document_state(self, doc_id: str, state: dict):
+        await self.redis.set(f"doc:{doc_id}:state", json.dumps(state))
+
+    async def delete_document_state(self, doc_id: str):
+        await self.redis.delete(f"doc:{doc_id}:state")

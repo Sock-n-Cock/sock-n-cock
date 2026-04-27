@@ -46,8 +46,13 @@ class KafkaManager:
             await self.consumer.stop()
             self.consumer = None
 
-    async def produce(self, doc_id: str, user_id: str, data: dict):
-        payload = json.dumps({**data, 'userId': user_id}).encode()
+    async def produce(self, doc_id: str, event_type: str, user_id: str, data: dict):
+        payload = json.dumps({
+            'type': event_type,
+            'userId': user_id,
+            'data': data
+        }).encode()
+
         await self.producer.send(TOPIC, value=payload, key=doc_id.encode())
 
     async def _commit_offset(self):
@@ -56,14 +61,20 @@ class KafkaManager:
 
         await self.consumer.commit()
 
-    async def _handle_message(self, msg, broadcast_edit):
+    async def _handle_message(self, msg, process_message):
         try:
             if msg.key is None:
                 raise ValueError("Kafka message is missing a document key.")
 
-            data = json.loads(msg.value.decode())
+            payload = json.loads(msg.value.decode())
             doc_id = msg.key.decode()
-            await broadcast_edit(doc_id, data)
+
+            await process_message(
+                doc_id,
+                payload.get('type'),
+                payload.get('userId'),
+                payload.get('data', {})
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -81,13 +92,12 @@ class KafkaManager:
                 logger.exception("Failed to commit Kafka consumer offset.")
 
     async def _consume_loop(self):
-        # Import lazily to avoid a module-level circular import with main.py.
-        from main import broadcast_edit
+        from main import process_kafka_message
 
         while self.consumer is not None:
             try:
                 async for msg in self.consumer:
-                    await self._handle_message(msg, broadcast_edit)
+                    await self._handle_message(msg, process_kafka_message)
                 return
             except asyncio.CancelledError:
                 raise
