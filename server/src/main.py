@@ -8,11 +8,13 @@ from kafka import KafkaManager
 from redis_manager import RedisManager
 from mongo_manager import MongoManager
 
-
 mongo_manager = MongoManager()
 redis_manager = RedisManager()
 kafka = KafkaManager()
-sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
+
+sio_mgr = socketio.AsyncRedisManager('redis://localhost:6379/0')
+sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*', client_manager=sio_mgr)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -21,6 +23,7 @@ async def lifespan(app: FastAPI):
     yield
     await kafka.stop()
     await mongo_manager.close()
+
 
 fastapi_app = FastAPI(lifespan=lifespan)
 fastapi_app.add_middleware(
@@ -33,12 +36,11 @@ fastapi_app.add_middleware(
 
 app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app)
 
-documents: dict[str, dict] = {}
 save_tasks: dict[str, asyncio.Task] = {}
+
 
 @fastapi_app.get("/documents")
 async def list_documents():
-    """Возвращает список всех ID документов из базы данных"""
     return await mongo_manager.get_all_document_ids()
 
 
@@ -49,35 +51,14 @@ async def delete_document(doc_id: str):
         del save_tasks[doc_id]
 
     await mongo_manager.delete_document(doc_id)
-
-    if doc_id in documents:
-        del documents[doc_id]
+    await redis_manager.delete_document_state(doc_id)
     return {"status": "deleted"}
-
-
-# async def _save_to_db_delayed(doc_id: str, delay: float = 1000):
-#     try:
-#         await asyncio.sleep(delay)
-#         document = documents.get(doc_id)
-#         if document:
-#             history_to_save = document['history'][-200:] if document.get('history') else []
-#
-#             await mongo_manager.update_document_state(
-#                 doc_id=doc_id,
-#                 content=document['content'],
-#                 version=document['version'],
-#                 history=history_to_save
-#             )
-#     except asyncio.CancelledError:
-#         return
-#     except Exception as e:
-#         print(f"Error saving to MongoDB: {e}")
 
 
 async def _save_to_db_delayed(doc_id: str, delay: float = 1.0):
     try:
         await asyncio.sleep(delay)
-        document = documents.get(doc_id)
+        document = await redis_manager.get_document_state(doc_id)
         if document:
             history_to_save = document['history'][-200:] if document.get('history') else []
 
@@ -89,7 +70,6 @@ async def _save_to_db_delayed(doc_id: str, delay: float = 1.0):
             )
 
             await sio.emit('document-saved', {'docId': doc_id}, room=doc_id)
-            print(f"DEBUG: Document {doc_id} actually written to MongoDB")
 
     except asyncio.CancelledError:
         return
@@ -98,16 +78,18 @@ async def _save_to_db_delayed(doc_id: str, delay: float = 1.0):
 
 
 async def _get_document(doc_id: str):
-    if doc_id not in documents:
-        doc = await mongo_manager.get_document(doc_id)
-        if doc:
-            documents[doc_id] = doc
-        else:
-            new_doc = {"_id": doc_id, "content": "", "version": 0, "history": []}
-            documents[doc_id] = new_doc
-            await mongo_manager.create_document(new_doc)
+    doc = await redis_manager.get_document_state(doc_id)
+    if doc:
+        return doc
 
-    return documents[doc_id]
+    doc = await mongo_manager.get_document(doc_id)
+    if not doc:
+        doc = {"_id": doc_id, "content": "", "version": 0, "history": []}
+        await mongo_manager.create_document(doc)
+
+    await redis_manager.set_document_state(doc_id, doc)
+    return doc
+
 
 async def _emit_document_state(doc_id: str, target_sid: str):
     document = await _get_document(doc_id)
@@ -133,7 +115,6 @@ async def disconnect(sid):
             await sio.emit('users-changed', users, room=doc_id)
             await sio.emit('user-left', sid, room=doc_id)
             await sio.leave_room(sid, doc_id)
-            print(f"User {sid} removed from doc {doc_id}")
     except Exception as e:
         print(f"Error in disconnect for {sid}: {e}")
 
@@ -160,13 +141,10 @@ async def join(sid, data):
         }
 
         await redis_manager.add_user(doc_id, sid, user_data)
-
         users = await redis_manager.get_users(doc_id)
 
         await sio.emit('users-changed', users, room=doc_id)
         await _emit_document_state(doc_id, sid)
-
-        print(f"User {sid} ({data['userName']}) joined doc {doc_id}")
 
     except Exception as e:
         print(f"Error in join for {sid}: {e}")
@@ -188,7 +166,6 @@ async def leave(sid, data):
             await sio.emit('user-left', sid, room=doc_id)
 
         await sio.leave_room(sid, doc_id)
-        print(f"User {sid} left room {doc_id}")
 
     except Exception as e:
         print(f"Error in leave for {sid}: {e}")
@@ -197,25 +174,47 @@ async def leave(sid, data):
 @sio.on('client-op')
 async def client_op(sid, data):
     try:
-        await kafka.produce(data['docId'], sid, data)
+        await kafka.produce(data['docId'], 'client-op', sid, data)
     except Exception as e:
-        print(f"Error producing to Kafka: {e}")
+        print(f"Error producing client-op to Kafka: {e}")
         await sio.emit('error', {'message': 'Failed to process operation'}, to=sid)
 
 
 @sio.on('cursor-move')
 async def cursor_move(sid, data):
     try:
-        doc_id = data['docId']
-        await sio.emit('remote-cursor', {**data, 'userId': sid}, room=doc_id, skip_sid=sid)
+        await kafka.produce(data['docId'], 'cursor-move', sid, data)
     except Exception as e:
-        print(f"Error in cursor-move: {e}")
+        print(f"Error producing cursor-move to Kafka: {e}")
 
 
-async def broadcast_edit(doc_id: str, data: IncomingOperation):
+# --- Kafka Message Router ---
+
+async def process_kafka_message(doc_id: str, event_type: str, user_id: str, data: dict):
+    if event_type == 'client-op':
+        await handle_client_op(doc_id, user_id, data)
+    elif event_type == 'cursor-move':
+        await handle_cursor_move(doc_id, user_id, data)
+    else:
+        print(f"Unknown event type from Kafka: {event_type}")
+
+
+async def handle_cursor_move(doc_id: str, user_id: str, data: dict):
+    # AsyncRedisManager гарантирует доставку всем клиентам в room, независимо от их ноды
+    await sio.emit('remote-cursor', {**data, 'userId': user_id}, room=doc_id, skip_sid=user_id)
+
+
+async def handle_client_op(doc_id: str, user_id: str, data: dict):
+    # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Восстанавливаем userId в payload, чтобы фронтенд
+    # (App.tsx) узнал свою операцию и не применял её повторно.
+    data['userId'] = user_id
+
     try:
         document = await _get_document(doc_id)
-        base_version = int(data['baseVersion'])
+        # Type hinting для валидации
+        incoming_op: IncomingOperation = data
+
+        base_version = int(incoming_op['baseVersion'])
         current_version = int(document['version'])
 
         if base_version < 0 or base_version > current_version:
@@ -224,7 +223,7 @@ async def broadcast_edit(doc_id: str, data: IncomingOperation):
             )
 
         history: list[AppliedOperation] = document['history']
-        rebased = rebase_operation(data, history[base_version:])
+        rebased = rebase_operation(incoming_op, history[base_version:])
 
         document['content'] = apply_operation(str(document['content']), rebased)
         document['version'] = current_version + 1
@@ -240,21 +239,19 @@ async def broadcast_edit(doc_id: str, data: IncomingOperation):
         if len(history) > MAX_HISTORY:
             document['history'] = history[-MAX_HISTORY:]
 
+        await redis_manager.set_document_state(doc_id, document)
+
         if doc_id in save_tasks:
             save_tasks[doc_id].cancel()
 
         save_tasks[doc_id] = asyncio.create_task(_save_to_db_delayed(doc_id, delay=1.0))
 
+        # Отправляем обновленную операцию всем в комнате
         await sio.emit('server-update', applied, room=doc_id)
 
     except ValueError as e:
         print(f"Discarding invalid edit for {doc_id}: {e}")
-        user_id = data.get('userId')
         if user_id:
             await _emit_document_state(doc_id, user_id)
     except Exception as e:
-        print(f"Error in broadcast_edit for doc {doc_id}: {e}")
-
-
-
-
+        print(f"Error in handle_client_op for doc {doc_id}: {e}")
