@@ -29,17 +29,9 @@ fastapi_app.add_middleware(
 
 app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app)
 
-documents: dict[str, dict] = {}
-
-
-def _get_document(doc_id: str) -> dict:
-    if doc_id not in documents:
-        documents[doc_id] = {"content": "", "version": 0, "history": []}
-    return documents[doc_id]
-
 
 async def _emit_document_state(doc_id: str, target_sid: str):
-    document = _get_document(doc_id)
+    document = await redis_manager.get_document(doc_id)
     await sio.emit('document-state', {
         'docId': doc_id,
         'content': document['content'],
@@ -144,26 +136,36 @@ async def cursor_move(sid, data):
 
 async def broadcast_edit(doc_id: str, data: IncomingOperation):
     try:
-        document = _get_document(doc_id)
+        doc = await redis_manager.get_document(doc_id)
+        current_version = doc["version"]
         base_version = int(data['baseVersion'])
-        current_version = int(document['version'])
 
         if base_version < 0 or base_version > current_version:
-            raise ValueError(
-                f"Client edit references invalid version {base_version}, current version is {current_version}."
-            )
+            print(f"Discarding invalid edit for {doc_id}: {base_version} > {current_version}")
+            user_id = data.get('userId')
+            if user_id:
+                await _emit_document_state(doc_id, user_id)
+            return
 
-        history: list[AppliedOperation] = document['history']
+        history = doc["history"]
         rebased = rebase_operation(data, history[base_version:])
-
-        document['content'] = apply_operation(str(document['content']), rebased)
-        document['version'] = current_version + 1
+        new_content = apply_operation(str(doc["content"]), rebased)
+        new_version = current_version + 1
 
         applied: AppliedOperation = {
             **rebased,
-            'version': int(document['version']),
+            'version': new_version,
         }
-        history.append(applied)
+
+        success = await redis_manager.update_document(
+            doc_id, new_content, new_version, applied, current_version
+        )
+        if not success:
+            print(f"Conflict on {doc_id}, resending state")
+            user_id = data.get('userId')
+            if user_id:
+                await _emit_document_state(doc_id, user_id)
+            return
 
         await sio.emit('server-update', applied, room=doc_id)
 
