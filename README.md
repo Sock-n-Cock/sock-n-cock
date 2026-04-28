@@ -22,14 +22,14 @@ Collaborative real-time text editor with Socket.IO, FastAPI, Monaco, and Kafka.
 ```text
 .
 ├── client/              # React + Vite + Monaco frontend
-├── server/              # FastAPI + Socket.IO + Kafka backend
+├── server/              # FastAPI + Socket.IO + Kafka backend + MongoDB
 └── docker-compose.yml   # Kafka broker for edit distribution
 ```
 
 ## Launch
 
-1. Start Kafka and Redis (Docker) from the project root:
-ц
+1. Start Kafka, Redis and MongoDB (Docker) from the project root:
+
 ```bash
 docker compose up -d
 ```
