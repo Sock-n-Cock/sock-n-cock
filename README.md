@@ -1,6 +1,6 @@
 # sock-n-cock
 
-Collaborative real-time text editor with Socket.IO, FastAPI, Monaco, and Kafka.
+Collaborative real-time text editor with Socket.IO, FastAPI, Monaco, Kafka, MongoDB.
 
 ## What It Does
 
