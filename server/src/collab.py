@@ -26,6 +26,10 @@ BoundaryAttachment = Literal["left", "right"]
 def transform_boundary(
     offset: int, applied: BaseOperation, attachment: BoundaryAttachment
 ) -> int:
+    """
+    Adjusts an operation index offset based on a preceding applied operation.
+    Identical logic to TypeScript `transformBoundary` implementation.
+    """
     inserted_length = len(applied["text"])
     deleted_length = applied["end"] - applied["start"]
 
@@ -72,6 +76,10 @@ def transform_operation(
 def rebase_operation(
     operation: IncomingOperation, history: list[AppliedOperation]
 ) -> IncomingOperation:
+    """
+    Rebases an incoming operation incrementally against a history log.
+    Ensures final execution coordinates align with current document state.
+    """
     rebased: IncomingOperation = {**operation}
     for applied in history:
         rebased = {
@@ -82,9 +90,11 @@ def rebase_operation(
 
 
 def apply_operation(content: str, operation: BaseOperation) -> str:
+    """Applies a resolved operation mutation to a text snapshot."""
     start = operation["start"]
     end = operation["end"]
 
+    # Strict bounds checking to prevent index corruption during text slicing
     if start < 0 or end < start or end > len(content):
         raise ValueError(
             f"Offsets ({start}, {end}) are outside the current document of length {len(content)}."

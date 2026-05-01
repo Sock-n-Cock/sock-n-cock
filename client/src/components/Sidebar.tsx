@@ -17,11 +17,13 @@ export const Sidebar: React.FC<SidebarProps> = ({ isConnected, roomUsers, curren
   const [roomInput, setRoomInput] = useState(docId);
   const [isLogsVisible, setIsLogsVisible] = useState(true);
 
+  // Sync internal input state with external document ID changes
   useEffect(() => { setRoomInput(docId); }, [docId]);
 
   const handleRoomChange = (e: React.FormEvent) => {
     e.preventDefault();
-    if (roomInput.trim() && roomInput !== docId) onJoinRoom(roomInput.trim());
+    const cleanRoomId = roomInput.trim();
+    if (cleanRoomId && cleanRoomId !== docId) onJoinRoom(cleanRoomId);
   };
 
   return (
@@ -71,12 +73,11 @@ export const Sidebar: React.FC<SidebarProps> = ({ isConnected, roomUsers, curren
               >
                 <span className="user-name" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{doc}</span>
 
-                {/* Кнопка удаления */}
                 <Trash2
                   size={14}
                   style={{ color: '#ef4444', minWidth: '14px', opacity: 0.7 }}
                   onClick={(e) => {
-                    e.stopPropagation(); // Чтобы клик не вызывал onJoinRoom
+                    e.stopPropagation(); // Prevent triggering the room join when deleting
                     onDeleteDoc(doc);
                   }}
                   onMouseEnter={(e) => e.currentTarget.style.opacity = '1'}
@@ -105,6 +106,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ isConnected, roomUsers, curren
         </div>
       </div>
 
+      {/* Collapsible system logs panel for monitoring socket/OT events */}
       <div className={`logs-panel ${isLogsVisible ? 'expanded' : 'collapsed'}`}>
         <div className="logs-header" onClick={() => setIsLogsVisible(!isLogsVisible)}>
           <span className="flex-center gap-2">

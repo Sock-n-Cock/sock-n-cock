@@ -36,6 +36,7 @@ fastapi_app.add_middleware(
 
 app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app)
 
+# Track pending DB writes to implement debouncing
 save_tasks: dict[str, asyncio.Task] = {}
 
 
@@ -56,6 +57,7 @@ async def delete_document(doc_id: str):
 
 
 async def _save_to_db_delayed(doc_id: str, delay: float = 1.0):
+    """Debounces document persistence to avoid DB bottlenecks during rapid typing."""
     try:
         await asyncio.sleep(delay)
         document = await redis_manager.get_document_state(doc_id)
@@ -72,12 +74,14 @@ async def _save_to_db_delayed(doc_id: str, delay: float = 1.0):
             await sio.emit('document-saved', {'docId': doc_id}, room=doc_id)
 
     except asyncio.CancelledError:
+        # Task was replaced by a newer save request
         return
     except Exception as e:
         print(f"Error saving to MongoDB: {e}")
 
 
 async def _get_document(doc_id: str):
+    """Retrieves document from cache or falls back to permanent storage."""
     doc = await redis_manager.get_document_state(doc_id)
     if doc:
         return doc
@@ -118,8 +122,6 @@ async def disconnect(sid):
     except Exception as e:
         print(f"Error in disconnect for {sid}: {e}")
 
-    print(f"Disconnected: {sid}")
-
 
 @sio.event
 async def join(sid, data):
@@ -127,6 +129,8 @@ async def join(sid, data):
         doc_id = data['docId']
 
         existing_users = await redis_manager.get_users(doc_id)
+
+        # Prevent duplicate joins if user is already in the room
         if any(user['id'] == sid for user in existing_users):
             await sio.enter_room(sid, doc_id)
             await _emit_document_state(doc_id, sid)
@@ -173,6 +177,7 @@ async def leave(sid, data):
 
 @sio.on('client-op')
 async def client_op(sid, data):
+    # Route operations through Kafka to guarantee strict sequential ordering per document
     try:
         await kafka.produce(data['docId'], 'client-op', sid, data)
     except Exception as e:
@@ -200,18 +205,17 @@ async def process_kafka_message(doc_id: str, event_type: str, user_id: str, data
 
 
 async def handle_cursor_move(doc_id: str, user_id: str, data: dict):
-    # AsyncRedisManager гарантирует доставку всем клиентам в room, независимо от их ноды
+    # skip_sid prevents echoing the cursor back to the user who moved it
     await sio.emit('remote-cursor', {**data, 'userId': user_id}, room=doc_id, skip_sid=user_id)
 
 
 async def handle_client_op(doc_id: str, user_id: str, data: dict):
-    # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Восстанавливаем userId в payload, чтобы фронтенд
-    # (App.tsx) узнал свою операцию и не применял её повторно.
+    # Ensure the frontend can identify its own operations to avoid duplicate application
     data['userId'] = user_id
 
     try:
         document = await _get_document(doc_id)
-        # Type hinting для валидации
+        # Type hinting for validation
         incoming_op: IncomingOperation = data
 
         base_version = int(incoming_op['baseVersion'])
@@ -222,6 +226,7 @@ async def handle_client_op(doc_id: str, user_id: str, data: dict):
                 f"Client edit references invalid version {base_version}, current version is {current_version}."
             )
 
+        # Rebase the incoming operation against server history (Operational Transformation)
         history: list[AppliedOperation] = document['history']
         rebased = rebase_operation(incoming_op, history[base_version:])
 
@@ -235,22 +240,25 @@ async def handle_client_op(doc_id: str, user_id: str, data: dict):
 
         history.append(applied)
 
+        # Retain only a bounded history to prevent infinite memory growth
         MAX_HISTORY = 200
         if len(history) > MAX_HISTORY:
             document['history'] = history[-MAX_HISTORY:]
 
         await redis_manager.set_document_state(doc_id, document)
 
+        # Schedule or reschedule background DB sync
         if doc_id in save_tasks:
             save_tasks[doc_id].cancel()
 
         save_tasks[doc_id] = asyncio.create_task(_save_to_db_delayed(doc_id, delay=1.0))
 
-        # Отправляем обновленную операцию всем в комнате
+        # Send updated operation for all in room
         await sio.emit('server-update', applied, room=doc_id)
 
     except ValueError as e:
         print(f"Discarding invalid edit for {doc_id}: {e}")
+        # Send full snapshot to force client resync on invalid state
         if user_id:
             await _emit_document_state(doc_id, user_id)
     except Exception as e:
