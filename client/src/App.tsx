@@ -10,6 +10,7 @@ import { rebasePendingOperations } from './collab';
 import { generateSafeId, getTrimmedLogs, generateUserCredentials, generateOperationId } from './utils';
 import type { User, RemoteCursorData, ServerOp, DocumentState, PendingClientOp } from './types';
 
+// Initializing WebSocket-client
 const socket = io('ws://localhost:3001', {
   transports: ['websocket'],
   autoConnect: true,
@@ -23,8 +24,14 @@ const socket = io('ws://localhost:3001', {
 type MonacoEditorInstance = Parameters<OnMount>[0];
 type MonacoInstance = Parameters<OnMount>[1];
 
+// Generate name and color of user
 const { name: USER_NAME, color: USER_COLOR } = generateUserCredentials();
 
+/**
+ * Apply full snapshot of document in editor.
+ * Use isApplyingRemote flag for preventing cycles
+ * (notifying that change was not local).
+ */
 function applySnapshotToEditor(
   editorInstance: MonacoEditorInstance | null,
   content: string,
@@ -42,6 +49,9 @@ function applySnapshotToEditor(
   }
 }
 
+/**
+ * Targeted remote operation (pasting/deletion) application in current Monaco model.
+ */
 function applyRemoteOpToEditor(
   editorInstance: MonacoEditorInstance | null,
   op: ServerOp,
@@ -50,6 +60,7 @@ function applyRemoteOpToEditor(
   const model = editorInstance?.getModel();
   if (!model) return false;
 
+  // Transform absolute offsets in Monaco coordinates (row/column)
   const start = model.getPositionAt(op.start);
   const end = model.getPositionAt(op.end);
 
@@ -63,7 +74,7 @@ function applyRemoteOpToEditor(
         endColumn: end.column,
       },
       text: op.text,
-      forceMoveMarkers: true
+      forceMoveMarkers: true // Shift local cursor
     }]);
     return true;
   } finally {
@@ -76,24 +87,26 @@ function App() {
   const monacoRef = useRef<MonacoInstance>(null);
 
   const docIdRef = useRef<string>('main-room');
-  const decorationsRef = useRef<Record<string, string[]>>({});
+  const decorationsRef = useRef<Record<string, string[]>>({}); // Store cursor ID decorations
   const isApplyingRemote = useRef<boolean>(false);
-  const isHydratedRef = useRef(false);
+  const isHydratedRef = useRef(false); // Flag: start state is received
+
+  // Operational Transformation Queues
   const pendingSnapshotRef = useRef<DocumentState | null>(null);
   const queuedRemoteOpsRef = useRef<ServerOp[]>([]);
   const pendingLocalOpsRef = useRef<PendingClientOp[]>([]);
   const serverVersionRef = useRef<number | null>(null);
 
+  // UI
   const [docId, setDocId] = useState('main-room');
   const [logs, setLogs] = useState<string[]>([]);
   const [isConnected, setIsConnected] = useState(socket.connected);
   const [isHydrated, setIsHydrated] = useState(false);
   const [roomUsers, setRoomUsers] = useState<User[]>([]);
-
   const [availableDocs, setAvailableDocs] = useState<string[]>([]);
-  // Changed isSaving to a more descriptive saveStatus
   const [saveStatus, setSaveStatus] = useState<'synced' | 'saving' | 'db-saved'>('synced');
 
+  // Sync document list using REST API
   const fetchDocuments = async () => {
     try {
       const res = await fetch('http://localhost:3001/documents');
@@ -106,7 +119,6 @@ function App() {
     }
   };
 
-
   const deleteDocument = async (idToDelete: string) => {
     if (!confirm(`Are you sure you want to delete document "${idToDelete}"?`)) return;
 
@@ -115,7 +127,7 @@ function App() {
       if (res.ok) {
         setAvailableDocs(prev => prev.filter(d => d !== idToDelete));
         if (idToDelete === docIdRef.current) {
-          joinRoom('main-room');
+          joinRoom('main-room'); // Main room if current was deleted
         }
       }
     } catch (e) {
@@ -128,10 +140,13 @@ function App() {
   }, []);
 
   const addLog = (msg: string) => setLogs(prev => getTrimmedLogs(msg, prev));
+
+  // State sync
   useEffect(() => {
     docIdRef.current = docId;
   }, [docId]);
 
+  // Reset sync queues if room was changed
   const resetSyncState = () => {
     pendingSnapshotRef.current = null;
     queuedRemoteOpsRef.current = [];
@@ -156,6 +171,7 @@ function App() {
     fetchDocuments();
   };
 
+  // CSS and Monaco decorations cleanup for leaving users
   const removeUserDecorations = (userId: string) => {
     if (editorRef.current && decorationsRef.current[userId]) {
       editorRef.current.deltaDecorations(decorationsRef.current[userId], []);
@@ -166,6 +182,10 @@ function App() {
     }
   };
 
+  /**
+   * Send next local operation on server.
+   * Guarantee sequential sending for one version increment.
+   */
   const sendNextPendingOp = () => {
     const currentVersion = serverVersionRef.current;
     const nextOp = pendingLocalOpsRef.current[0];
@@ -185,11 +205,15 @@ function App() {
     });
   };
 
+  /**
+   * Handle local change from Monaco.
+   */
   const handleEditorChange = (_value: string | undefined, event?: editor.IModelContentChangedEvent) => {
     if (isApplyingRemote.current || !socket.connected || !isHydrated || !event) return;
 
-    setSaveStatus('saving'); // Start saving process visually
+    setSaveStatus('saving');
 
+    // IMPORTANT: Sorting from right to left (descending offset).
     const pendingOps = [...event.changes]
       .sort((left, right) => right.rangeOffset - left.rangeOffset)
       .map<PendingClientOp>(change => ({
@@ -205,6 +229,10 @@ function App() {
     sendNextPendingOp();
   };
 
+  /**
+   * Apply all stored remote operations after document load
+   * or when connection is reestablished.
+   */
   const flushQueuedRemoteOps = (editorInstance: MonacoEditorInstance | null) => {
     const currentVersion = serverVersionRef.current;
     if (!editorInstance || currentVersion === null) return;
@@ -218,9 +246,11 @@ function App() {
     pendingOps.forEach(op => {
       serverVersionRef.current = op.version;
 
+      // Remove our operations
       if (op.userId === socket.id) {
         pendingLocalOpsRef.current = pendingLocalOpsRef.current.filter(localOp => localOp.opId !== op.opId);
       } else {
+        // Rebase our stored but not sent operation yet
         const rebased = rebasePendingOperations(pendingLocalOpsRef.current, op);
         pendingLocalOpsRef.current = rebased.pending;
 
@@ -233,6 +263,10 @@ function App() {
     sendNextPendingOp();
   };
 
+  /**
+   * Draw cursors and selections other users over editor.
+   * Use dynamic tag creation <style> for names pseudoelements.
+   */
   const updateRemoteCursor = (data: RemoteCursorData) => {
     const { userId, selection, name, color } = data;
     if (!editorRef.current || !monacoRef.current || !selection) return;
@@ -240,6 +274,7 @@ function App() {
     const safeId = generateSafeId(userId);
     const newDecorations = [];
 
+    // Selection
     if (selection.startLineNumber !== selection.endLineNumber || selection.startColumn !== selection.endColumn) {
       newDecorations.push({
         range: new monacoRef.current.Range(selection.startLineNumber, selection.startColumn, selection.endLineNumber, selection.endColumn),
@@ -247,14 +282,17 @@ function App() {
       });
     }
 
+    // Cursor (caret)
     newDecorations.push({
       range: new monacoRef.current.Range(selection.positionLineNumber, selection.positionColumn, selection.positionLineNumber, selection.positionColumn),
       options: {
         className: `remote-cursor-${safeId}`,
+        // Do not shift cursor if someone writing straight forward after it
         stickiness: monacoRef.current.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges
       }
     });
 
+    // CSS injection for custom users names displaying
     if (!document.getElementById(`style-${safeId}`)) {
       const style = document.createElement('style');
       style.id = `style-${safeId}`;
@@ -267,9 +305,11 @@ function App() {
       document.head.appendChild(style);
     }
 
+    // Apply new, remove old
     decorationsRef.current[userId] = editorRef.current.deltaDecorations(decorationsRef.current[userId] || [], newDecorations);
   };
 
+  // Initializing Socket.IO handlers
   useEffect(() => {
     const onConnect = () => {
       setIsConnected(true);
@@ -307,6 +347,7 @@ function App() {
     socket.on('users-changed', (users: User[]) => {
       setRoomUsers(users);
       const activeIds = users.map((u: User) => u.id);
+      // Remove "orphaned" cursors
       Object.keys(decorationsRef.current).forEach(id => {
         if (!activeIds.includes(id) && id !== socket.id) removeUserDecorations(id);
       });
@@ -325,21 +366,25 @@ function App() {
         return prev;
       });
 
+      // If document loading, add into the queue
       if (serverVersionRef.current === null || !editorRef.current) {
         queuedRemoteOpsRef.current.push(op);
         return;
       }
 
+      // Ignore old handled operations
       if (op.version <= serverVersionRef.current) return;
 
       serverVersionRef.current = op.version;
 
+      // Handle local operation
       if (op.userId === socket.id) {
         pendingLocalOpsRef.current = pendingLocalOpsRef.current.filter(localOp => localOp.opId !== op.opId);
         sendNextPendingOp();
         return;
       }
 
+      // Conflict Resolution (OT)
       const rebased = rebasePendingOperations(pendingLocalOpsRef.current, op);
       pendingLocalOpsRef.current = rebased.pending;
 
@@ -355,6 +400,7 @@ function App() {
       setTimeout(() => setSaveStatus('synced'), 2000);
     });
 
+    // Listener cleanup when dismounted
     return () => {
       socket.off('connect');
       socket.off('disconnect');
@@ -411,6 +457,7 @@ function App() {
             onMount={(editor, monaco) => {
               editorRef.current = editor;
               monacoRef.current = monaco;
+
               if (pendingSnapshotRef.current) {
                 if (applySnapshotToEditor(editor, pendingSnapshotRef.current.content, isApplyingRemote)) {
                   serverVersionRef.current = pendingSnapshotRef.current.version;
@@ -420,6 +467,7 @@ function App() {
                 }
               }
 
+              // Translation cursor position
               editor.onDidChangeCursorSelection((e) => {
                 if (!socket.connected || !isHydratedRef.current) return;
                 socket.emit('cursor-move', {
@@ -439,7 +487,7 @@ function App() {
               smoothScrolling: true,
               cursorSmoothCaretAnimation: 'on',
               formatOnPaste: true,
-              readOnly: !isHydrated,
+              readOnly: !isHydrated, // Blocking input until synchronised
               scrollbar: { verticalScrollbarSize: 10, horizontalScrollbarSize: 10 },
             }}
           />

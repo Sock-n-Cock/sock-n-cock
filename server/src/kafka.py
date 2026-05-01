@@ -9,8 +9,11 @@ TOPIC = "code-changes"
 
 logger = logging.getLogger(__name__)
 
-
 class KafkaManager:
+    """
+    Manages Kafka producer and consumer streams.
+    Crucial for ordering operations strictly across multiple server instances.
+    """
     def __init__(self):
         self.producer = None
         self.consumer = None
@@ -22,6 +25,7 @@ class KafkaManager:
         self.producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BROKER)
         await self.producer.start()
 
+        # Disable auto-commit to ensure we only acknowledge processing after OT finishes
         self.consumer = AIOKafkaConsumer(
             TOPIC,
             bootstrap_servers=KAFKA_BROKER,
@@ -47,6 +51,11 @@ class KafkaManager:
             self.consumer = None
 
     async def produce(self, doc_id: str, event_type: str, user_id: str, data: dict):
+        """
+        Publishes an event to Kafka.
+        Using doc_id as the routing key ensures all operations for a specific document
+        land on the same partition, guaranteeing chronological order.
+        """
         payload = json.dumps({
             'type': event_type,
             'userId': user_id,
@@ -79,7 +88,7 @@ class KafkaManager:
             raise
         except Exception:
             logger.exception(
-                "Failed to process Kafka message at partition=%s offset=%s. Skipping it to keep the consumer alive.",
+                "Failed to process Kafka message at partition=%s offset=%s. Skipping to maintain stream flow.",
                 getattr(msg, 'partition', '?'),
                 getattr(msg, 'offset', '?'),
             )
@@ -92,6 +101,7 @@ class KafkaManager:
                 logger.exception("Failed to commit Kafka consumer offset.")
 
     async def _consume_loop(self):
+        # Deferred import to prevent circular dependency issues
         from main import process_kafka_message
 
         while self.consumer is not None:
